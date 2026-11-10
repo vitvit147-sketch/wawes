@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.local
+pushToGitHub.mjs
+*.bat
+public/music/*.mp3
+.DS_Store
