@@ -4,7 +4,9 @@ import {
   computeExpectedPosition,
   computeDriftAction,
   getStartCountdownMs,
-  evaluateBarrierReadiness
+  evaluateBarrierReadiness,
+  moveTrackAfterCurrent,
+  buildPrefetchOrder
 } from '../src/utils/syncEngine.js';
 
 test('computeExpectedPosition returns 0 when no trackId', () => {
@@ -145,4 +147,38 @@ test('evaluateBarrierReadiness tracks online participants waiting and readiness 
   assert.equal(full.allReady, true);
   assert.equal(full.readyCount, 2);
   assert.equal(full.avgProgress, 100);
+});
+
+test('moveTrackAfterCurrent moves chosen track immediately after current track regardless of direction', () => {
+  const q = [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }];
+
+  // Перемещение трека с конца сразу после первого
+  const movedForward = moveTrackAfterCurrent(q, 'a', 'd');
+  assert.deepEqual(
+    movedForward.map((t) => t.id),
+    ['a', 'd', 'b', 'c']
+  );
+
+  // Перемещение раннего трека после середины списка
+  const movedFromBefore = moveTrackAfterCurrent(q, 'c', 'a');
+  assert.deepEqual(
+    movedFromBefore.map((t) => t.id),
+    ['b', 'c', 'a', 'd']
+  );
+
+  // Ничего не играет — ставится первым
+  const movedWhenIdle = moveTrackAfterCurrent(q, null, 'c');
+  assert.deepEqual(
+    movedWhenIdle.map((t) => t.id),
+    ['c', 'a', 'b', 'd']
+  );
+});
+
+test('buildPrefetchOrder prioritizes upcoming tracks wrapping circularly after current', () => {
+  const q = [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }];
+  const order = buildPrefetchOrder(q, 'c');
+  assert.deepEqual(
+    order.map((t) => t.id),
+    ['d', 'a', 'b']
+  );
 });

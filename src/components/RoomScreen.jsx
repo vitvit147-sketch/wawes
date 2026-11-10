@@ -6,10 +6,18 @@ import {
   computeExpectedPosition,
   computeDriftAction,
   getStartCountdownMs,
-  evaluateBarrierReadiness
+  evaluateBarrierReadiness,
+  moveTrackAfterCurrent,
+  buildPrefetchOrder
 } from '../utils/syncEngine';
 import { resolveTrackMetadata } from '../utils/mediaUrlResolver';
-import { loadTrackToBlobUrl, prefetchTrack, setPinnedUrls } from '../utils/trackLoader';
+import {
+  loadTrackToBlobUrl,
+  setPinnedUrls,
+  startQueuePrefetchPipeline,
+  subscribeTrackCache,
+  isTrackReadyInCache
+} from '../utils/trackLoader';
 import PlayerCard from './PlayerCard';
 import QueuePanel from './QueuePanel';
 import LobbyPanel from './LobbyPanel';
@@ -39,6 +47,7 @@ export default function RoomScreen({
   const [isBuffering, setIsBuffering] = useState(false);
   const [isAddingUrl, setIsAddingUrl] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
+  const [cacheVersion, setCacheVersion] = useState(0);
   const [downloadState, setDownloadState] = useState({
     trackId: null,
     stage: 'idle',
@@ -56,6 +65,7 @@ export default function RoomScreen({
   const launchedBarrierNonceRef = useRef(null);
   const lastSeekAtRef = useRef(0);
   const isBufferingRef = useRef(false);
+  const lastCacheSyncRef = useRef({ nextReadyId: undefined, cachedCount: -1 });
 
   const queue = room?.queue || [];
   const playback = room?.playback || {};
@@ -78,6 +88,23 @@ export default function RoomScreen({
     () => evaluateBarrierReadiness(participants, currentTrack?.id),
     [participants, currentTrack?.id]
   );
+
+  const nextTrackPrefetchInfo = useMemo(() => {
+    if (!nextTrack?.id) return null;
+    const online = participants.filter((p) => p.isOnline !== false);
+    const readyCount = online.filter((p) => p.nextReadyTrackId === nextTrack.id).length;
+    return {
+      track: nextTrack,
+      readyCount,
+      onlineCount: online.length,
+      allReady: online.length > 0 && readyCount === online.length
+    };
+  }, [participants, nextTrack]);
+
+  // Подписка на события кэша/фоновой загрузки для мгновенного обновления UI
+  useEffect(() => {
+    return subscribeTrackCache(() => setCacheVersion((v) => v + 1));
+  }, []);
 
   // Высокоточная NTP-калибровка часов сразу при входе в комнату
   useEffect(() => {
@@ -234,39 +261,78 @@ export default function RoomScreen({
     };
   }, [room?.code, participantId, currentTrack?.id, currentTrack?.url, currentTrack?.source]);
 
-  // Отдельный эффект для удержания нужных Blob URL и фоновой предзагрузки следующего трека
+  const queueSig = useMemo(
+    () => queue.map((t) => `${t.id}:${t.url}`).join('|'),
+    [queue]
+  );
+
+  // Удержание нужных Blob URL в памяти и умный фоновый конвейер предзагрузки всей очереди
   useEffect(() => {
     setPinnedUrls([currentTrack?.url, nextTrack?.url].filter(Boolean));
 
-    const isCurrentReady =
-      currentTrack?.id &&
-      downloadState.trackId === currentTrack.id &&
-      (downloadState.stage === 'ready' || downloadState.stage === 'direct-stream');
+    if (queue.length === 0) return;
 
-    if (
-      !isCurrentReady ||
-      !nextTrack?.url ||
-      nextTrack.source === 'soundcloud' ||
-      nextTrack.source === 'youtube'
-    ) {
-      return;
-    }
+    const isCurrentDone =
+      !currentTrack ||
+      (downloadState.trackId === currentTrack.id &&
+        (downloadState.stage === 'ready' || downloadState.stage === 'direct-stream'));
 
+    if (!isCurrentDone) return;
+
+    const orderedTracks = buildPrefetchOrder(queue, currentTrack?.id);
+    if (orderedTracks.length === 0) return;
+
+    let stopPipeline = () => {};
     const timer = setTimeout(() => {
-      prefetchTrack(nextTrack.url, nextTrack.sizeBytes || 0);
-    }, 450);
+      stopPipeline = startQueuePrefetchPipeline(orderedTracks);
+    }, 350);
 
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      stopPipeline();
+    };
   }, [
+    queueSig,
     currentTrack?.id,
     currentTrack?.url,
-    nextTrack?.id,
     nextTrack?.url,
-    nextTrack?.sizeBytes,
-    nextTrack?.source,
     downloadState.trackId,
     downloadState.stage
   ]);
+
+  // Отправка в комнату статуса предзагрузки следующего трека и общего числа кэшированных треков
+  useEffect(() => {
+    const code = room?.code;
+    if (!code || !participantId) return;
+
+    let cachedCount = 0;
+    for (const t of queue) {
+      if (t.source === 'soundcloud' || t.source === 'youtube' || isTrackReadyInCache(t.url)) {
+        cachedCount++;
+      }
+    }
+
+    const isNextReady = Boolean(
+      nextTrack &&
+        (nextTrack.source === 'soundcloud' ||
+          nextTrack.source === 'youtube' ||
+          isTrackReadyInCache(nextTrack.url))
+    );
+    const nextReadyId = isNextReady ? nextTrack.id : null;
+
+    if (
+      lastCacheSyncRef.current.nextReadyId !== nextReadyId ||
+      lastCacheSyncRef.current.cachedCount !== cachedCount
+    ) {
+      lastCacheSyncRef.current = { nextReadyId, cachedCount };
+      musicRoomClient
+        .updateParticipantStatus(code, participantId, {
+          nextReadyTrackId: nextReadyId,
+          cachedTrackCount: cachedCount
+        })
+        .catch(() => {});
+    }
+  }, [room?.code, participantId, queueSig, nextTrack?.id, nextTrack?.url, cacheVersion]);
 
   // Барьерный триггер хоста: как только ВСЕ онлайн-участники загрузили трек (100%),
   // ставим общую будущую миллисекунду старта (serverNow + 650мс)
@@ -395,17 +461,22 @@ export default function RoomScreen({
     []
   );
 
-  // Добавление всех 20 треков в 1 клик
+  // Добавление всех 20 треков в 1 клик (без дублирования уже добавленных)
   const handleAddBatchTracks = useCallback(
     async (presets) => {
       if (!isHost || !room?.code) return;
       setIsAddingUrl(true);
       try {
         const currentQueue = roomRef.current?.queue || [];
-        const newItems = presets.map((p, idx) => ({
-          ...p,
-          id: p.id || 'skz_' + Date.now().toString(36) + '_' + idx
-        }));
+        const existingUrls = new Set(currentQueue.map((t) => t.url));
+        const newItems = presets
+          .filter((p) => !existingUrls.has(p.url))
+          .map((p, idx) => ({
+            ...p,
+            id: p.id || 'skz_' + Date.now().toString(36) + '_' + idx
+          }));
+        if (newItems.length === 0) return;
+
         const newQueue = [...currentQueue, ...newItems];
         await musicRoomClient.updateQueue(room.code, newQueue);
 
@@ -419,17 +490,35 @@ export default function RoomScreen({
     [isHost, room?.code, launchTrackAsHost]
   );
 
-  // Добавление трека по ссылке
+  // Добавление трека по ссылке или пресета
   const handleAddTrackByUrl = useCallback(
     async (url, presetMeta = null) => {
       if (!isHost || !room?.code) return;
       setIsAddingUrl(true);
       try {
+        const currentQueue = roomRef.current?.queue || [];
+        // Если нажали на уже добавленный пресет — переставляем его «Следующим» для мгновенного прелоада у всех!
+        if (presetMeta) {
+          const existing = currentQueue.find(
+            (t) => t.url === presetMeta.url || t.id === presetMeta.id
+          );
+          if (existing) {
+            if (existing.id !== roomRef.current?.playback?.trackId) {
+              const nextQueue = moveTrackAfterCurrent(
+                currentQueue,
+                roomRef.current?.playback?.trackId,
+                existing.id
+              );
+              await musicRoomClient.updateQueue(room.code, nextQueue);
+            }
+            return;
+          }
+        }
+
         let meta = presetMeta ? { ...presetMeta } : await resolveTrackMetadata(url);
-        if (!meta.id) {
+        if (!meta.id || currentQueue.some((t) => t.id === meta.id)) {
           meta.id = 't_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
         }
-        const currentQueue = roomRef.current?.queue || [];
         const newQueue = [...currentQueue, meta];
         await musicRoomClient.updateQueue(room.code, newQueue);
 
@@ -441,6 +530,18 @@ export default function RoomScreen({
       }
     },
     [isHost, room?.code, launchTrackAsHost]
+  );
+
+  // Поставить выбранный трек в очереди сразу следующим — слушатели тут же начнут его качать заранее
+  const handlePlayNextInQueue = useCallback(
+    async (trackId) => {
+      if (!isHost || !room?.code) return;
+      const currentQueue = roomRef.current?.queue || [];
+      const currentId = roomRef.current?.playback?.trackId;
+      const updated = moveTrackAfterCurrent(currentQueue, currentId, trackId);
+      await musicRoomClient.updateQueue(room.code, updated);
+    },
+    [isHost, room?.code]
   );
 
   // Включение выбранного трека из очереди
@@ -783,6 +884,7 @@ export default function RoomScreen({
           downloadState={downloadState}
           barrierState={barrierState}
           countdownMs={countdownMs}
+          nextTrackPrefetchInfo={nextTrackPrefetchInfo}
           onUnlockAutoplay={handleUnlockAutoplay}
           onPrevTrack={handlePrevTrack}
           onPlayOrPause={handlePlayOrPause}
@@ -810,11 +912,14 @@ export default function RoomScreen({
             queue={queue}
             isHost={isHost}
             currentTrack={currentTrack}
+            nextTrackId={nextTrack?.id}
             playback={playback}
+            cacheVersion={cacheVersion}
             isAddingUrl={isAddingUrl}
             onAddTrackByUrl={handleAddTrackByUrl}
             onAddBatchTracks={handleAddBatchTracks}
             onPlayTrack={handlePlayTrack}
+            onPlayNextInQueue={handlePlayNextInQueue}
             onMoveTrack={handleMoveTrack}
             onRemoveTrack={handleRemoveTrack}
           />
@@ -823,6 +928,8 @@ export default function RoomScreen({
             participants={participants}
             participantId={participantId}
             currentTrack={currentTrack}
+            nextTrack={nextTrack}
+            queueLength={queue.length}
             playback={playback}
           />
         </div>

@@ -5,6 +5,8 @@ export default function LobbyPanel({
   participants = [],
   participantId,
   currentTrack,
+  nextTrack,
+  queueLength = 0,
   playback
 }) {
   const onlineCount = participants.filter((p) => p.isOnline !== false).length;
@@ -71,6 +73,8 @@ export default function LobbyPanel({
 
             const showProgressBar =
               isOnline && Boolean(trackId) && !isReadyForTrack && pct < 100;
+            const isNextReady = Boolean(nextTrack?.id && p.nextReadyTrackId === nextTrack.id);
+            const cachedCount = Number(p.cachedTrackCount) || 0;
 
             return (
               <div
@@ -131,6 +135,30 @@ export default function LobbyPanel({
                       className="h-full rounded-full bg-gradient-to-r from-sky-400 to-indigo-400 transition-all duration-200"
                       style={{ width: `${Math.max(4, pct)}%` }}
                     />
+                  </div>
+                )}
+
+                {isOnline && (nextTrack?.id || queueLength > 0) && (
+                  <div className="mt-2 pt-2 border-t border-white/5 flex items-center justify-between gap-2 text-[10px]">
+                    {nextTrack?.id ? (
+                      isNextReady ? (
+                        <span className="text-emerald-300 font-bold">
+                          ⏭️ След. трек готов ⚡
+                        </span>
+                      ) : (
+                        <span className="text-sky-300/80 font-medium">
+                          ⬇️ Предзагрузка след. трека...
+                        </span>
+                      )
+                    ) : (
+                      <span />
+                    )}
+
+                    {queueLength > 0 && (
+                      <span className="text-slate-400 font-mono shrink-0">
+                        Кэш: {Math.min(cachedCount, queueLength)}/{queueLength}
+                      </span>
+                    )}
                   </div>
                 )}
               </div>

@@ -136,3 +136,34 @@ export function computeDriftAction({ expectedPos, actualPos, isPlaying, duration
 
   return { type: 'none', rate: 1.0, driftMs };
 }
+
+/**
+ * Переставляет трек `targetTrackId` сразу после текущего трека `currentTrackId` («Играть следующим»).
+ */
+export function moveTrackAfterCurrent(queue = [], currentTrackId, targetTrackId) {
+  const list = [...(queue || [])];
+  const fromIdx = list.findIndex((t) => t?.id === targetTrackId);
+  if (fromIdx < 0 || targetTrackId === currentTrackId) return list;
+
+  const [picked] = list.splice(fromIdx, 1);
+  const currentIdx = currentTrackId ? list.findIndex((t) => t?.id === currentTrackId) : -1;
+  const insertIdx = currentIdx >= 0 ? currentIdx + 1 : 0;
+  list.splice(insertIdx, 0, picked);
+  return list;
+}
+
+/**
+ * Формирует приоритетный порядок фоновой предзагрузки очереди:
+ * сначала ближайшие треки после текущего по кругу, затем остальные.
+ */
+export function buildPrefetchOrder(queue = [], currentTrackId) {
+  if (!Array.isArray(queue) || queue.length === 0) return [];
+  const curIdx = currentTrackId ? queue.findIndex((t) => t?.id === currentTrackId) : -1;
+  if (curIdx < 0) return [...queue];
+
+  const ordered = [];
+  for (let offset = 1; offset < queue.length; offset++) {
+    ordered.push(queue[(curIdx + offset) % queue.length]);
+  }
+  return ordered;
+}

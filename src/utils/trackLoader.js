@@ -1,12 +1,62 @@
-// Загрузчик аудиотреков в оперативную память (Blob + Cache Storage) с реальной шкалой прогресса и фоновой предзагрузкой
+// Загрузчик аудиотреков в RAM (Blob) и дисковый кэш браузера (Cache Storage)
+// с реальной шкалой прогресса и умным фоновым конвейером предзагрузки очереди
 import { inferMimeType } from './audioMetadata';
 
 const CACHE_NAME = 'wavesync-audio-v2';
-const MAX_MEMORY_BLOBS = 6;
+const MAX_MEMORY_BLOBS = 4;
 
 const memoryCache = new Map(); // resolvedUrl -> { blobUrl, sizeBytes, contentType, lastUsedAt }
-const inFlightDownloads = new Map(); // resolvedUrl -> { promise, listeners: Set, latestProgress }
+const persistedUrls = new Set(); // resolvedUrl присутствующие в Cache Storage
+const inFlightDownloads = new Map(); // resolvedUrl -> { promise, listeners, latestProgress, needBlobUrl }
 const pinnedUrls = new Set();
+const cacheWatchers = new Set();
+
+let activeForegroundDownloads = 0;
+let notifyTimer = null;
+
+function notifyCacheWatchers(immediate = false) {
+  if (immediate) {
+    if (notifyTimer) {
+      clearTimeout(notifyTimer);
+      notifyTimer = null;
+    }
+    for (const cb of cacheWatchers) {
+      try {
+        cb();
+      } catch {}
+    }
+    return;
+  }
+
+  if (notifyTimer) return;
+  notifyTimer = setTimeout(() => {
+    notifyTimer = null;
+    for (const cb of cacheWatchers) {
+      try {
+        cb();
+      } catch {}
+    }
+  }, 180);
+}
+
+// Первичное сканирование уже скачанных на устройство треков при запуске
+if (typeof window !== 'undefined' && window.caches) {
+  window.caches
+    .open(CACHE_NAME)
+    .then((cache) => cache.keys())
+    .then((requests) => {
+      for (const req of requests) {
+        if (req.url) persistedUrls.add(req.url);
+      }
+      if (requests.length > 0) notifyCacheWatchers(true);
+    })
+    .catch(() => {});
+}
+
+export function subscribeTrackCache(cb) {
+  cacheWatchers.add(cb);
+  return () => cacheWatchers.delete(cb);
+}
 
 export function resolvePlayableUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return '';
@@ -25,6 +75,35 @@ export function resolvePlayableUrl(rawUrl) {
 export function isTrackCachedInMemory(rawUrl) {
   const url = resolvePlayableUrl(rawUrl);
   return Boolean(url && memoryCache.has(url));
+}
+
+export function isTrackReadyInCache(rawUrl) {
+  const url = resolvePlayableUrl(rawUrl);
+  return Boolean(url && (memoryCache.has(url) || persistedUrls.has(url)));
+}
+
+export function getTrackCacheStatus(rawUrl) {
+  const url = resolvePlayableUrl(rawUrl);
+  if (!url) {
+    return { inMemory: false, inDiskCache: false, isReady: false, isDownloading: false, progress: 0 };
+  }
+  const inMemory = memoryCache.has(url);
+  const inDiskCache = persistedUrls.has(url);
+  const flight = inFlightDownloads.get(url);
+  const isDownloading = Boolean(flight && !inMemory);
+  const progress = inMemory || inDiskCache ? 100 : flight?.latestProgress?.percent || 0;
+
+  return {
+    inMemory,
+    inDiskCache,
+    isReady: inMemory || inDiskCache,
+    isDownloading,
+    progress
+  };
+}
+
+export function hasActiveForegroundDownload() {
+  return activeForegroundDownloads > 0;
 }
 
 function evictOldBlobsIfNeeded() {
@@ -72,6 +151,7 @@ async function tryReadFromCacheStorage(resolvedUrl) {
     if (!match) return null;
     const blob = await match.blob();
     if (!blob || blob.size === 0) return null;
+    persistedUrls.add(resolvedUrl);
     return {
       blob,
       contentType: resolveMime(resolvedUrl, match.headers.get('content-type') || blob.type)
@@ -93,18 +173,37 @@ async function tryWriteToCacheStorage(resolvedUrl, blob, contentType) {
       }
     });
     await cache.put(resolvedUrl, response);
+    persistedUrls.add(resolvedUrl);
+    notifyCacheWatchers(true);
   } catch {
-    // Тихо игнорируем нехватку квоты (например, в приватном режиме Safari)
+    // Игнорируем нехватку квоты (например, приватный режим браузера)
   }
 }
 
+function storeMemoryBlob(resolvedUrl, blob, contentType) {
+  const typedBlob = blob.type === contentType ? blob : new Blob([blob], { type: contentType });
+  const blobUrl = URL.createObjectURL(typedBlob);
+  memoryCache.set(resolvedUrl, {
+    blobUrl,
+    sizeBytes: typedBlob.size,
+    contentType,
+    lastUsedAt: Date.now()
+  });
+  evictOldBlobsIfNeeded();
+  notifyCacheWatchers(true);
+  return blobUrl;
+}
+
 /**
- * Скачивает трек целиком в оперативную память с отображением прогресса (% / байты / скорость).
- * Если трек уже есть в RAM или Cache Storage — отдаёт мгновенно (100%).
- * Если сторонний хост блокирует CORS — аккуратно переключается на direct-stream.
+ * Загружает трек в память (Blob URL) и/или в дисковый кэш (Cache Storage) с прогресс-коллбэком.
  */
 export async function loadTrackToBlobUrl(rawUrl, options = {}) {
-  const { expectedSizeBytes = 0, onProgress } = options;
+  const {
+    expectedSizeBytes = 0,
+    onProgress,
+    foreground = true,
+    skipBlobUrl = false
+  } = options;
   const resolvedUrl = resolvePlayableUrl(rawUrl);
 
   if (!resolvedUrl) {
@@ -131,18 +230,47 @@ export async function loadTrackToBlobUrl(rawUrl, options = {}) {
     };
   }
 
-  // 2. Если этот трек уже качается (например, фоновым preload) — подключаемся к нему же
+  // 2. Если фоновый прелоад в диск и трек уже на диске — готово за 0 мс!
+  if (skipBlobUrl && persistedUrls.has(resolvedUrl)) {
+    onProgress?.({
+      stage: 'ready',
+      percent: 100,
+      loadedBytes: expectedSizeBytes,
+      totalBytes: expectedSizeBytes,
+      speedBps: 0,
+      fromCache: true
+    });
+    return {
+      playableUrl: null,
+      mode: 'disk-cache',
+      sizeBytes: expectedSizeBytes,
+      fromCache: true
+    };
+  }
+
+  // 3. Если трек уже качается в фоне — переиспользуем тот же поток загрузки
   const existing = inFlightDownloads.get(resolvedUrl);
   if (existing) {
+    if (!skipBlobUrl) existing.needBlobUrl = true;
     if (onProgress) {
       existing.listeners.add(onProgress);
       if (existing.latestProgress) {
         onProgress(existing.latestProgress);
       }
     }
+    if (foreground) activeForegroundDownloads++;
     try {
-      return await existing.promise;
+      const res = await existing.promise;
+      if (!skipBlobUrl && !res.playableUrl) {
+        const disk = await tryReadFromCacheStorage(resolvedUrl);
+        if (disk) {
+          const blobUrl = storeMemoryBlob(resolvedUrl, disk.blob, disk.contentType);
+          return { playableUrl: blobUrl, mode: 'memory', sizeBytes: disk.blob.size, fromCache: true };
+        }
+      }
+      return res;
     } finally {
+      if (foreground) activeForegroundDownloads = Math.max(0, activeForegroundDownloads - 1);
       if (onProgress) existing.listeners.delete(onProgress);
     }
   }
@@ -152,6 +280,7 @@ export async function loadTrackToBlobUrl(rawUrl, options = {}) {
 
   const entry = {
     listeners,
+    needBlobUrl: !skipBlobUrl,
     latestProgress: {
       stage: 'downloading',
       percent: 0,
@@ -170,43 +299,37 @@ export async function loadTrackToBlobUrl(rawUrl, options = {}) {
         cb(payload);
       } catch {}
     }
+    notifyCacheWatchers(false);
   };
 
   inFlightDownloads.set(resolvedUrl, entry);
+  if (foreground) activeForegroundDownloads++;
 
   entry.promise = (async () => {
-    // 3. Проверяем Cache Storage браузера (мгновенное чтение с диска без сети)
+    // 4. Проверяем Cache Storage
     const diskHit = await tryReadFromCacheStorage(resolvedUrl);
     if (diskHit) {
-      const typedBlob =
-        diskHit.blob.type === diskHit.contentType
-          ? diskHit.blob
-          : new Blob([diskHit.blob], { type: diskHit.contentType });
-      const blobUrl = URL.createObjectURL(typedBlob);
-      memoryCache.set(resolvedUrl, {
-        blobUrl,
-        sizeBytes: typedBlob.size,
-        contentType: diskHit.contentType,
-        lastUsedAt: Date.now()
-      });
-      evictOldBlobsIfNeeded();
+      let blobUrl = null;
+      if (entry.needBlobUrl) {
+        blobUrl = storeMemoryBlob(resolvedUrl, diskHit.blob, diskHit.contentType);
+      }
       emitProgress({
         stage: 'ready',
         percent: 100,
-        loadedBytes: typedBlob.size,
-        totalBytes: typedBlob.size,
+        loadedBytes: diskHit.blob.size,
+        totalBytes: diskHit.blob.size,
         speedBps: 0,
         fromCache: true
       });
       return {
         playableUrl: blobUrl,
-        mode: 'memory',
-        sizeBytes: typedBlob.size,
+        mode: entry.needBlobUrl ? 'memory' : 'disk-cache',
+        sizeBytes: diskHit.blob.size,
         fromCache: true
       };
     }
 
-    // 4. Потоковое скачивание по сети с подсчетом прогресса
+    // 5. Потоковое скачивание по сети
     try {
       emitProgress(entry.latestProgress);
       const response = await fetch(resolvedUrl, { mode: 'cors', credentials: 'omit' });
@@ -218,81 +341,52 @@ export async function loadTrackToBlobUrl(rawUrl, options = {}) {
       const headerLen = Number(response.headers.get('content-length')) || 0;
       const totalBytes = headerLen > 0 ? headerLen : Number(expectedSizeBytes) || 0;
 
-      if (!response.body || !response.body.getReader) {
-        const blob = await response.blob();
-        const typedBlob = blob.type ? blob : new Blob([blob], { type: contentType });
-        await tryWriteToCacheStorage(resolvedUrl, typedBlob, contentType);
-        const blobUrl = URL.createObjectURL(typedBlob);
-        memoryCache.set(resolvedUrl, {
-          blobUrl,
-          sizeBytes: typedBlob.size,
-          contentType,
-          lastUsedAt: Date.now()
-        });
-        evictOldBlobsIfNeeded();
-        emitProgress({
-          stage: 'ready',
-          percent: 100,
-          loadedBytes: typedBlob.size,
-          totalBytes: typedBlob.size,
-          speedBps: 0,
-          fromCache: false
-        });
-        return {
-          playableUrl: blobUrl,
-          mode: 'memory',
-          sizeBytes: typedBlob.size,
-          fromCache: false
-        };
-      }
-
-      const reader = response.body.getReader();
-      const chunks = [];
-      let loadedBytes = 0;
+      let blob;
       const startedAt = performance.now();
-      let lastEmitAt = 0;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value && value.byteLength > 0) {
-          chunks.push(value);
-          loadedBytes += value.byteLength;
+      if (!response.body || !response.body.getReader) {
+        blob = await response.blob();
+        if (!blob.type) blob = new Blob([blob], { type: contentType });
+      } else {
+        const reader = response.body.getReader();
+        const chunks = [];
+        let loadedBytes = 0;
+        let lastEmitAt = 0;
 
-          const now = performance.now();
-          if (now - lastEmitAt >= 100) {
-            lastEmitAt = now;
-            const elapsedSec = Math.max(0.05, (now - startedAt) / 1000);
-            const speedBps = loadedBytes / elapsedSec;
-            const denom = Math.max(totalBytes, loadedBytes);
-            const percent =
-              totalBytes > 0
-                ? Math.min(99, Math.round((loadedBytes / denom) * 100))
-                : Math.min(95, Math.round((loadedBytes / (2.2 * 1024 * 1024)) * 90));
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.byteLength > 0) {
+            chunks.push(value);
+            loadedBytes += value.byteLength;
 
-            emitProgress({
-              stage: 'downloading',
-              percent,
-              loadedBytes,
-              totalBytes,
-              speedBps,
-              fromCache: false
-            });
+            const now = performance.now();
+            if (now - lastEmitAt >= 120) {
+              lastEmitAt = now;
+              const elapsedSec = Math.max(0.05, (now - startedAt) / 1000);
+              const speedBps = loadedBytes / elapsedSec;
+              const denom = Math.max(totalBytes, loadedBytes);
+              const percent =
+                totalBytes > 0
+                  ? Math.min(99, Math.round((loadedBytes / denom) * 100))
+                  : Math.min(95, Math.round((loadedBytes / (2.2 * 1024 * 1024)) * 90));
+
+              emitProgress({
+                stage: 'downloading',
+                percent,
+                loadedBytes,
+                totalBytes,
+                speedBps,
+                fromCache: false
+              });
+            }
           }
         }
+        blob = new Blob(chunks, { type: contentType });
       }
 
-      const blob = new Blob(chunks, { type: contentType });
       await tryWriteToCacheStorage(resolvedUrl, blob, contentType);
-      const blobUrl = URL.createObjectURL(blob);
-
-      memoryCache.set(resolvedUrl, {
-        blobUrl,
-        sizeBytes: blob.size,
-        contentType,
-        lastUsedAt: Date.now()
-      });
-      evictOldBlobsIfNeeded();
+      const blobUrl = entry.needBlobUrl ? storeMemoryBlob(resolvedUrl, blob, contentType) : null;
 
       const totalElapsedSec = Math.max(0.05, (performance.now() - startedAt) / 1000);
       emitProgress({
@@ -306,13 +400,12 @@ export async function loadTrackToBlobUrl(rawUrl, options = {}) {
 
       return {
         playableUrl: blobUrl,
-        mode: 'memory',
+        mode: entry.needBlobUrl ? 'memory' : 'disk-cache',
         sizeBytes: blob.size,
         fromCache: false
       };
     } catch (err) {
-      // Если сторонний хост блокирует CORS (например Яндекс Диск), играем потоком напрямую
-      console.warn('Track blob preload failed, falling back to direct stream:', resolvedUrl, err);
+      console.warn('Track preload CORS/network fallback to direct-stream:', resolvedUrl, err);
       emitProgress({
         stage: 'direct-stream',
         percent: 100,
@@ -330,16 +423,60 @@ export async function loadTrackToBlobUrl(rawUrl, options = {}) {
     }
   })().finally(() => {
     inFlightDownloads.delete(resolvedUrl);
+    if (foreground) activeForegroundDownloads = Math.max(0, activeForegroundDownloads - 1);
+    notifyCacheWatchers(true);
   });
 
   return entry.promise;
 }
 
 /**
- * Тихая фоновая предзагрузка следующего трека, чтобы смена трека происходила за 0 мс.
+ * Быстрая предзагрузка одного трека в память (используется для следующего трека).
  */
 export function prefetchTrack(rawUrl, expectedSizeBytes = 0) {
   const resolved = resolvePlayableUrl(rawUrl);
-  if (!resolved || memoryCache.has(resolved) || inFlightDownloads.has(resolved)) return;
-  loadTrackToBlobUrl(resolved, { expectedSizeBytes }).catch(() => {});
+  if (!resolved) return Promise.resolve(null);
+  return loadTrackToBlobUrl(resolved, {
+    expectedSizeBytes,
+    foreground: false,
+    skipBlobUrl: false
+  }).catch(() => null);
+}
+
+/**
+ * Последовательно предзагружает всю очередь по приоритету (ближайшие — в RAM, остальные — на диск),
+ * не мешая загрузке активного трека. Возвращает функцию отмены при перестроении очереди.
+ */
+export function startQueuePrefetchPipeline(tracks = []) {
+  let cancelled = false;
+
+  (async () => {
+    for (let i = 0; i < tracks.length; i++) {
+      if (cancelled) return;
+      const track = tracks[i];
+      if (!track?.url || track.source === 'soundcloud' || track.source === 'youtube') continue;
+
+      // Если сейчас качается текущий активный трек — ждём завершения, чтобы не делить канал
+      while (!cancelled && activeForegroundDownloads > 0) {
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      if (cancelled) return;
+
+      // Первый ближайший трек держим в RAM (Blob URL = 0 мс старт), остальные — в Cache Storage
+      const keepInRam = i === 0;
+      const status = getTrackCacheStatus(track.url);
+      if (keepInRam && status.inMemory) continue;
+      if (!keepInRam && status.isReady) continue;
+
+      await loadTrackToBlobUrl(track.url, {
+        expectedSizeBytes: track.sizeBytes || 0,
+        foreground: false,
+        skipBlobUrl: !keepInRam
+      }).catch(() => null);
+    }
+  })();
+
+  return () => {
+    cancelled = true;
+  };
 }

@@ -6,9 +6,9 @@ import {
   ArrowUp,
   ArrowDown,
   Loader2,
-  Radio,
   Sparkles,
-  ExternalLink
+  ListStart,
+  Check
 } from 'lucide-react';
 
 function YouTubeIcon({ className = "w-3 h-3 text-red-400" }) {
@@ -20,22 +20,32 @@ function YouTubeIcon({ className = "w-3 h-3 text-red-400" }) {
 }
 import { formatDuration, formatBytes } from '../utils/audioMetadata';
 import { DEMO_PRESETS } from '../utils/mediaUrlResolver';
-import { isTrackCachedInMemory } from '../utils/trackLoader';
+import { getTrackCacheStatus } from '../utils/trackLoader';
 
 export default function QueuePanel({
   queue = [],
   isHost,
   currentTrack,
+  nextTrackId,
   playback,
+  cacheVersion,
   isAddingUrl,
   onAddTrackByUrl,
   onAddBatchTracks,
   onPlayTrack,
+  onPlayNextInQueue,
   onMoveTrack,
   onRemoveTrack
 }) {
   const [inputUrl, setInputUrl] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+
+  const queueUrlSet = new Set(queue.map((t) => t.url));
+  const cachedCount = queue.reduce((acc, t) => {
+    if (t.source === 'soundcloud' || t.source === 'youtube') return acc + 1;
+    return acc + (getTrackCacheStatus(t.url).isReady ? 1 : 0);
+  }, 0);
+  const cachePct = queue.length > 0 ? Math.round((cachedCount / queue.length) * 100) : 0;
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -61,17 +71,40 @@ export default function QueuePanel({
 
   return (
     <section className="lg:col-span-3 rounded-3xl bg-slate-900/80 border border-white/10 p-5 shadow-xl">
-      <div className="flex items-center justify-between gap-3 mb-4">
+      <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
         <div className="flex items-center gap-2">
           <Music2 className="w-5 h-5 text-sky-400" />
           <h3 className="text-base font-extrabold text-white">
             Очередь треков ({queue.length})
           </h3>
         </div>
-        <span className="text-xs text-slate-400 font-semibold">
-          {isHost ? 'Хост формирует плейлист' : 'Синхронизировано'}
-        </span>
+        <div className="flex items-center gap-2 text-xs">
+          {queue.length > 0 && (
+            <span
+              className={`px-2 py-0.5 rounded-lg font-bold border ${
+                cachedCount === queue.length
+                  ? 'bg-emerald-500/15 border-emerald-400/30 text-emerald-300'
+                  : 'bg-sky-500/15 border-sky-400/30 text-sky-300'
+              }`}
+              title="Количество треков очереди, уже скачанных в локальный кэш этого устройства"
+            >
+              ⚡ Кэш: {cachedCount}/{queue.length}
+            </span>
+          )}
+          <span className="text-slate-400 font-semibold hidden sm:inline">
+            {isHost ? 'Ведущий' : 'Синхронизировано'}
+          </span>
+        </div>
       </div>
+
+      {queue.length > 0 && cachedCount < queue.length && (
+        <div className="mb-4 w-full h-1 rounded-full bg-slate-800 overflow-hidden">
+          <div
+            className="h-full rounded-full bg-gradient-to-r from-sky-400 to-emerald-400 transition-all duration-300"
+            style={{ width: `${Math.max(4, cachePct)}%` }}
+          />
+        </div>
+      )}
 
       {/* Форма добавления по ссылке (доступна хосту) */}
       {isHost && (
@@ -127,19 +160,41 @@ export default function QueuePanel({
               )}
             </div>
             <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto pr-1">
-              {DEMO_PRESETS.map((preset, idx) => (
-                <button
-                  key={idx}
-                  type="button"
-                  disabled={isAddingUrl}
-                  onClick={() => handleAddPreset(preset)}
-                  className="px-2.5 py-1.5 rounded-xl bg-slate-950/70 hover:bg-slate-800/80 border border-white/10 hover:border-sky-400/40 text-slate-300 text-xs font-medium transition-all flex items-center gap-1.5 cursor-pointer disabled:cursor-default"
-                >
-                  <Music2 className="w-3 h-3 text-sky-400 shrink-0" />
-                  <span className="truncate max-w-[130px]">{preset.title}</span>
-                </button>
-              ))}
+              {DEMO_PRESETS.map((preset, idx) => {
+                const isAdded = queueUrlSet.has(preset.url);
+                const isUpNext = nextTrackId === preset.id;
+                return (
+                  <button
+                    key={idx}
+                    type="button"
+                    disabled={isAddingUrl}
+                    onClick={() => handleAddPreset(preset)}
+                    title={
+                      isAdded
+                        ? 'Уже в очереди — нажмите, чтобы поставить «Следующим» и предзагрузить заранее'
+                        : 'Добавить в очередь'
+                    }
+                    className={`px-2.5 py-1.5 rounded-xl border text-xs font-medium transition-all flex items-center gap-1.5 cursor-pointer disabled:cursor-default ${
+                      isUpNext
+                        ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
+                        : isAdded
+                        ? 'bg-slate-900/90 border-sky-400/30 text-sky-200 hover:bg-sky-500/20'
+                        : 'bg-slate-950/70 hover:bg-slate-800/80 border-white/10 hover:border-sky-400/40 text-slate-300'
+                    }`}
+                  >
+                    {isAdded ? (
+                      <Check className="w-3 h-3 text-emerald-400 shrink-0" />
+                    ) : (
+                      <Music2 className="w-3 h-3 text-sky-400 shrink-0" />
+                    )}
+                    <span className="truncate max-w-[130px]">{preset.title}</span>
+                  </button>
+                );
+              })}
             </div>
+            <p className="text-[11px] text-slate-500 mt-1.5">
+              Совет: нажмите на любой добавленный трек (✓) или кнопку «След.» ниже — и он сразу предзагрузится у всех заранее.
+            </p>
           </div>
         </div>
       )}
@@ -155,9 +210,10 @@ export default function QueuePanel({
         <div className="space-y-2.5 max-h-[460px] overflow-y-auto pr-1">
           {queue.map((track, index) => {
             const isActive = track.id === currentTrack?.id;
+            const isUpNext = !isActive && track.id === nextTrackId;
             const isYouTube = track.source === 'youtube';
             const isSoundCloud = track.source === 'soundcloud';
-            const inMemory = isTrackCachedInMemory(track.url);
+            const cacheStatus = getTrackCacheStatus(track.url);
 
             return (
               <div
@@ -165,6 +221,8 @@ export default function QueuePanel({
                 className={`rounded-2xl p-3 border transition-all flex items-center justify-between gap-3 ${
                   isActive
                     ? 'bg-sky-500/15 border-sky-400/50 shadow-md shadow-sky-500/10'
+                    : isUpNext
+                    ? 'bg-emerald-500/10 border-emerald-400/35'
                     : 'bg-slate-950/60 border-white/5 hover:border-white/15'
                 }`}
               >
@@ -221,11 +279,24 @@ export default function QueuePanel({
                           <span>{formatBytes(track.sizeBytes)}</span>
                         </>
                       )}
-                      {inMemory && (
+                      {isUpNext && (
+                        <span className="px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 font-extrabold text-[10px]">
+                          ⏭️ След.
+                        </span>
+                      )}
+                      {cacheStatus.inMemory ? (
                         <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-bold text-[10px]">
                           ⚡ В RAM
                         </span>
-                      )}
+                      ) : cacheStatus.inDiskCache ? (
+                        <span className="px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-semibold text-[10px]">
+                          💾 В кэше
+                        </span>
+                      ) : cacheStatus.isDownloading ? (
+                        <span className="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 font-mono font-bold text-[10px]">
+                          ⬇️ {cacheStatus.progress}%
+                        </span>
+                      ) : null}
                     </div>
                   </div>
                 </button>
@@ -233,6 +304,17 @@ export default function QueuePanel({
                 {/* Действия для хоста */}
                 {isHost && (
                   <div className="flex items-center gap-1 shrink-0">
+                    {!isActive && !isUpNext && onPlayNextInQueue && (
+                      <button
+                        type="button"
+                        onClick={() => onPlayNextInQueue(track.id)}
+                        className="px-2 py-1.5 rounded-lg bg-sky-500/15 hover:bg-sky-500/30 border border-sky-400/25 text-sky-300 text-[11px] font-bold flex items-center gap-1 transition-all cursor-pointer"
+                        title="Поставить следующим треком (предзагрузится у всех заранее)"
+                      >
+                        <ListStart className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">След.</span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       disabled={index === 0}

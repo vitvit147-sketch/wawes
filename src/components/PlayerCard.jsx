@@ -51,6 +51,7 @@ export default function PlayerCard({
   downloadState,
   barrierState,
   countdownMs,
+  nextTrackPrefetchInfo,
   onUnlockAutoplay,
   onPrevTrack,
   onPlayOrPause,
@@ -543,6 +544,33 @@ export default function PlayerCard({
               </>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Компактная плашка готовности следующего трека на всех устройствах */}
+      {currentTrack && nextTrackPrefetchInfo?.track && (
+        <div className="mb-4 px-3.5 py-2 rounded-2xl bg-slate-950/60 border border-white/10 flex items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-2 min-w-0 text-slate-300">
+            <span className="text-slate-500 font-bold shrink-0">Далее:</span>
+            <span className="font-bold text-white truncate">
+              {nextTrackPrefetchInfo.track.title}
+            </span>
+          </div>
+          {nextTrackPrefetchInfo.allReady ? (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-400/30 text-emerald-300 font-bold shrink-0">
+              <Zap className="w-3 h-3" />
+              <span>
+                Предзагружен у всех ({nextTrackPrefetchInfo.readyCount}/{nextTrackPrefetchInfo.onlineCount})
+              </span>
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-sky-500/15 border border-sky-400/30 text-sky-300 font-semibold shrink-0">
+              <Download className="w-3 h-3 animate-pulse" />
+              <span>
+                Фон-загрузка ({nextTrackPrefetchInfo.readyCount}/{nextTrackPrefetchInfo.onlineCount})
+              </span>
+            </span>
+          )}
         </div>
       )}
 
