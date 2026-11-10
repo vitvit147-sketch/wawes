@@ -533,27 +533,41 @@ export default function RoomScreen({
     []
   );
 
-  // Добавление всех 20 треков в 1 клик (без дублирования уже добавленных)
+  // Пакетное добавление подборки или альбома (без дубликатов; при playNow = true сразу запускает первый трек)
   const handleAddBatchTracks = useCallback(
-    async (presets) => {
-      if (!isHost || !room?.code) return;
+    async (presets, playNow = false) => {
+      if (!isHost || !room?.code || !Array.isArray(presets) || presets.length === 0) return;
       setIsAddingUrl(true);
       try {
         const currentQueue = roomRef.current?.queue || [];
-        const existingUrls = new Set(currentQueue.map((t) => t.url));
+        const existingByUrl = new Map(currentQueue.map((t) => [t.url, t]));
         const newItems = presets
-          .filter((p) => !existingUrls.has(p.url))
+          .filter((p) => !existingByUrl.has(p.url))
           .map((p, idx) => ({
             ...p,
-            id: p.id || 'skz_' + Date.now().toString(36) + '_' + idx
+            id: p.id && !currentQueue.some((t) => t.id === p.id)
+              ? p.id
+              : 'skz_' + Date.now().toString(36) + '_' + idx
           }));
-        if (newItems.length === 0) return;
 
-        const newQueue = [...currentQueue, ...newItems];
-        await musicRoomClient.updateQueue(room.code, newQueue);
+        if (newItems.length > 0) {
+          const newQueue = [...currentQueue, ...newItems];
+          await musicRoomClient.updateQueue(room.code, newQueue);
+        }
 
-        if (!roomRef.current?.playback?.trackId || currentQueue.length === 0) {
-          await launchTrackAsHost(newItems[0].id, 0);
+        if (playNow) {
+          const firstPreset = presets[0];
+          const target =
+            existingByUrl.get(firstPreset.url) ||
+            newItems.find((x) => x.url === firstPreset.url) ||
+            newItems[0];
+          if (target?.id) {
+            advancingNonceRef.current = Date.now();
+            await launchTrackAsHost(target.id, 0);
+          }
+        } else if (!roomRef.current?.playback?.trackId || currentQueue.length === 0) {
+          const firstId = newItems[0]?.id || currentQueue[0]?.id;
+          if (firstId) await launchTrackAsHost(firstId, 0);
         }
       } finally {
         setIsAddingUrl(false);
@@ -561,6 +575,99 @@ export default function RoomScreen({
     },
     [isHost, room?.code, launchTrackAsHost]
   );
+
+  // Мгновенный запуск трека из Медиатеки (как в Spotify / Яндекс Музыке)
+  const handlePlayPresetNow = useCallback(
+    async (preset) => {
+      if (!isHost || !room?.code || !preset) return;
+      setIsAddingUrl(true);
+      try {
+        const currentQueue = roomRef.current?.queue || [];
+        const existing = currentQueue.find(
+          (t) => t.url === preset.url || t.id === preset.id
+        );
+        if (existing) {
+          advancingNonceRef.current = Date.now();
+          await launchTrackAsHost(existing.id, 0);
+          return;
+        }
+
+        const meta = {
+          ...preset,
+          id:
+            preset.id && !currentQueue.some((t) => t.id === preset.id)
+              ? preset.id
+              : 't_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5)
+        };
+        const currentId = roomRef.current?.playback?.trackId;
+        const nextQueue = currentId
+          ? moveTrackAfterCurrent([...currentQueue, meta], currentId, meta.id)
+          : [...currentQueue, meta];
+
+        await musicRoomClient.updateQueue(room.code, nextQueue);
+        advancingNonceRef.current = Date.now();
+        await launchTrackAsHost(meta.id, 0);
+      } finally {
+        setIsAddingUrl(false);
+      }
+    },
+    [isHost, room?.code, launchTrackAsHost]
+  );
+
+  // Поставить трек из Медиатеки следующим в очередь
+  const handlePlayPresetNext = useCallback(
+    async (preset) => {
+      if (!isHost || !room?.code || !preset) return;
+      setIsAddingUrl(true);
+      try {
+        const currentQueue = roomRef.current?.queue || [];
+        const currentId = roomRef.current?.playback?.trackId;
+        const existing = currentQueue.find(
+          (t) => t.url === preset.url || t.id === preset.id
+        );
+        if (existing) {
+          if (existing.id !== currentId) {
+            const nextQueue = moveTrackAfterCurrent(currentQueue, currentId, existing.id);
+            await musicRoomClient.updateQueue(room.code, nextQueue);
+          }
+          return;
+        }
+
+        const meta = {
+          ...preset,
+          id:
+            preset.id && !currentQueue.some((t) => t.id === preset.id)
+              ? preset.id
+              : 't_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5)
+        };
+        const nextQueue = currentId
+          ? moveTrackAfterCurrent([...currentQueue, meta], currentId, meta.id)
+          : [...currentQueue, meta];
+        await musicRoomClient.updateQueue(room.code, nextQueue);
+
+        if (!currentId || currentQueue.length === 0) {
+          await launchTrackAsHost(meta.id, 0);
+        }
+      } finally {
+        setIsAddingUrl(false);
+      }
+    },
+    [isHost, room?.code, launchTrackAsHost]
+  );
+
+  // Очистить всю очередь
+  const handleClearQueue = useCallback(async () => {
+    if (!isHost || !room?.code) return;
+    await musicRoomClient.updateQueue(room.code, []);
+    await musicRoomClient.updatePlayback(room.code, {
+      trackId: null,
+      phase: 'idle',
+      isPlaying: false,
+      anchorPos: 0,
+      anchorServerTime: getServerNow(),
+      actionNonce: Date.now()
+    });
+  }, [isHost, room?.code]);
 
   // Добавление трека по ссылке или пресета
   const handleAddTrackByUrl = useCallback(
@@ -990,10 +1097,13 @@ export default function RoomScreen({
             isAddingUrl={isAddingUrl}
             onAddTrackByUrl={handleAddTrackByUrl}
             onAddBatchTracks={handleAddBatchTracks}
+            onPlayPresetNow={handlePlayPresetNow}
+            onPlayPresetNext={handlePlayPresetNext}
             onPlayTrack={handlePlayTrack}
             onPlayNextInQueue={handlePlayNextInQueue}
             onMoveTrack={handleMoveTrack}
             onRemoveTrack={handleRemoveTrack}
+            onClearQueue={handleClearQueue}
           />
 
           <LobbyPanel
