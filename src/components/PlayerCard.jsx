@@ -128,8 +128,23 @@ export default function PlayerCard({
         },
         setPlaybackRate: (rate) => {
           if (!isSoundCloud && audioElRef.current) {
-            audioElRef.current.playbackRate = rate;
+            const audio = audioElRef.current;
+            if (Math.abs(audio.playbackRate - rate) > 0.002) {
+              // Отключаем тяжёлый WSOLA time-stretch на мобильных/Bluetooth чтобы не рвать звук
+              if ('preservesPitch' in audio) audio.preservesPitch = false;
+              if ('mozPreservesPitch' in audio) audio.mozPreservesPitch = false;
+              if ('webkitPreservesPitch' in audio) audio.webkitPreservesPitch = false;
+              audio.playbackRate = rate;
+            }
           }
+        },
+        getPlaybackRate: () => {
+          if (isSoundCloud) return 1.0;
+          return audioElRef.current?.playbackRate || 1.0;
+        },
+        isSeeking: () => {
+          if (isSoundCloud) return false;
+          return Boolean(audioElRef.current?.seeking);
         },
         isPaused: () => {
           if (isSoundCloud) return !playback?.isPlaying;
@@ -178,6 +193,7 @@ export default function PlayerCard({
     if (audio.src !== playableAudioSrc) {
       loadedTrackIdRef.current = null;
       audio.pause();
+      audio.playbackRate = 1.0;
       audio.src = playableAudioSrc;
       audio.load();
     }
@@ -192,12 +208,14 @@ export default function PlayerCard({
 
     if (!playableAudioSrc || !currentTrack?.id) {
       audio.pause();
+      audio.playbackRate = 1.0;
       return;
     }
 
     const isBarrierBuffering = playback?.phase === 'buffering';
     if (isBarrierBuffering || !playback?.isPlaying) {
       audio.pause();
+      audio.playbackRate = 1.0;
       const targetPos = Number(playback?.anchorPos) || 0;
       if (audio.readyState >= 1) {
         if (Math.abs(audio.currentTime - targetPos) > 0.05) {
@@ -215,6 +233,9 @@ export default function PlayerCard({
     const startPlaybackSynced = () => {
       const serverNow = getServerNow();
       const expected = computeExpectedPosition(playback, serverNow, effectiveDuration);
+      if (Math.abs(audio.playbackRate - 1.0) > 0.002) {
+        audio.playbackRate = 1.0;
+      }
 
       if (audio.readyState >= 1) {
         if (Math.abs(audio.currentTime - expected) > 0.08) {
@@ -408,7 +429,7 @@ export default function PlayerCard({
           <span
             className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-semibold ${
               firebaseStatus.connected
-                ? Math.abs(driftMs) <= 50 && playback?.isPlaying
+                ? Math.abs(driftMs) <= 140 && playback?.isPlaying
                   ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
                   : 'bg-sky-500/10 text-sky-300 border border-sky-500/25'
                 : 'bg-amber-500/10 text-amber-300 border border-amber-500/25'
@@ -426,7 +447,7 @@ export default function PlayerCard({
                 ? 'Буферизация...'
                 : !playback?.isPlaying
                 ? 'На паузе'
-                : Math.abs(driftMs) <= 50
+                : Math.abs(driftMs) <= 140
                 ? 'Синхронизировано'
                 : 'Подстройка...'
               : firebaseStatus.connected

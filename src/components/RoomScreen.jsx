@@ -64,8 +64,20 @@ export default function RoomScreen({
   const advancingNonceRef = useRef(null);
   const launchedBarrierNonceRef = useRef(null);
   const lastSeekAtRef = useRef(0);
+  const lastTransitionAtRef = useRef(Date.now());
+  const lastRateChangeAtRef = useRef(0);
+  const lastResumeAttemptAtRef = useRef(0);
+  const lastUiHalfSecRef = useRef(-1);
+  const smoothedDriftRef = useRef(null);
   const isBufferingRef = useRef(false);
   const lastCacheSyncRef = useRef({ nextReadyId: undefined, cachedCount: -1 });
+
+  const isMobileDevice = useMemo(
+    () =>
+      typeof navigator !== 'undefined' &&
+      /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || ''),
+    []
+  );
 
   const queue = room?.queue || [];
   const playback = room?.playback || {};
@@ -283,9 +295,11 @@ export default function RoomScreen({
     if (orderedTracks.length === 0) return;
 
     let stopPipeline = () => {};
+    const lookahead = isMobileDevice ? 2 : 4;
+    const startDelayMs = isMobileDevice ? 2000 : 600;
     const timer = setTimeout(() => {
-      stopPipeline = startQueuePrefetchPipeline(orderedTracks);
-    }, 350);
+      stopPipeline = startQueuePrefetchPipeline(orderedTracks, lookahead);
+    }, startDelayMs);
 
     return () => {
       clearTimeout(timer);
@@ -297,7 +311,8 @@ export default function RoomScreen({
     currentTrack?.url,
     nextTrack?.url,
     downloadState.trackId,
-    downloadState.stage
+    downloadState.stage,
+    isMobileDevice
   ]);
 
   // Отправка в комнату статуса предзагрузки следующего трека и общего числа кэшированных треков
@@ -366,68 +381,125 @@ export default function RoomScreen({
     barrierState.onlineCount
   ]);
 
-  // Быстрый и плавный цикл синхронизации (200 мс) по единой математике computeDriftAction
+  // Сброс окна сглаживания при смене трека / старте / паузе (защита Bluetooth HAL на Android)
+  useEffect(() => {
+    lastTransitionAtRef.current = Date.now();
+    smoothedDriftRef.current = null;
+    lastUiHalfSecRef.current = -1;
+  }, [currentTrack?.id, playback?.actionNonce, playback?.isPlaying, playback?.phase]);
+
+  // Плавный цикл синхронизации со сглаживанием джиттера (без дёргания Bluetooth/WSOLA)
   useEffect(() => {
     if (!currentTrack) {
       setCountdownMs(0);
       return;
     }
 
+    const syncIntervalMs = isMobileDevice ? 300 : 250;
+    const deadbandSec = isMobileDevice ? 0.14 : 0.08;
+    const exitDeadbandSec = isMobileDevice ? 0.055 : 0.035;
+    const seekThresholdSec = isMobileDevice ? 0.65 : 0.45;
+    const rateDelta = isMobileDevice ? 0.018 : 0.025;
+    const seekCooldownMs = isMobileDevice ? 3200 : 2000;
+    const rateCooldownMs = isMobileDevice ? 1400 : 900;
+    const graceMs = isMobileDevice ? 1800 : 900;
+
     const interval = setInterval(() => {
       if (isSeekingRef.current) return;
 
       const serverNow = getServerNow();
       const leftMs = getStartCountdownMs(playback, serverNow);
-      setCountdownMs(leftMs);
+      setCountdownMs((prev) => (prev === leftMs ? prev : leftMs));
 
       if (playback.phase === 'buffering' || leftMs > 0) {
-        setDisplayTime(playback.anchorPos || 0);
-        setDriftMs(0);
+        const anchor = playback.anchorPos || 0;
+        lastUiHalfSecRef.current = Math.floor(anchor * 2);
+        setDisplayTime((prev) => (Math.abs(prev - anchor) < 0.05 ? prev : anchor));
+        setDriftMs((prev) => (prev === 0 ? prev : 0));
         return;
       }
 
       const expectedPos = computeExpectedPosition(playback, serverNow, effectiveDuration);
-      setDisplayTime(expectedPos);
+      const halfSec = Math.floor(expectedPos * 2);
+      if (halfSec !== lastUiHalfSecRef.current) {
+        lastUiHalfSecRef.current = halfSec;
+        setDisplayTime(expectedPos);
+      }
 
-      if (!playerRef.current) return;
-      if (!playerRef.current.isTrackLoaded?.(currentTrack.id)) return;
+      const player = playerRef.current;
+      if (!player || !player.isTrackLoaded?.(currentTrack.id)) return;
+      if (player.isSeeking?.()) return;
 
+      const now = Date.now();
       try {
-        const currentLocal = playerRef.current.getCurrentTime();
+        const currentLocal = player.getCurrentTime();
         if (typeof currentLocal !== 'number' || isNaN(currentLocal) || currentLocal < 0) return;
 
-        // Если плеер в момент старта не успел запуститься (кроме блокировки автоплея) — запускаем
-        if (playback.isPlaying && playerRef.current.isPaused?.() && !autoplayBlocked) {
-          playerRef.current.resumePlayback?.();
+        // Если плеер в момент старта не успел запуститься (кроме блокировки автоплея) — запускаем с защитным таймаутом
+        if (playback.isPlaying && player.isPaused?.() && !autoplayBlocked) {
+          if (now - lastResumeAttemptAtRef.current > 1200) {
+            lastResumeAttemptAtRef.current = now;
+            player.resumePlayback?.();
+          }
           return;
         }
 
+        // Окно прогрева после старта/перемотки: даём Android MediaCodec и Bluetooth A2DP открыть поток без дёргания
+        if (
+          playback.isPlaying &&
+          (now - lastTransitionAtRef.current < graceMs || now - lastSeekAtRef.current < graceMs)
+        ) {
+          player.setPlaybackRate?.(1.0);
+          return;
+        }
+
+        const rawDrift = expectedPos - currentLocal;
+        const smoothedDrift =
+          smoothedDriftRef.current === null
+            ? rawDrift
+            : smoothedDriftRef.current * 0.6 + rawDrift * 0.4;
+        smoothedDriftRef.current = smoothedDrift;
+
+        const smoothedActualPos = Math.max(0, expectedPos - smoothedDrift);
+        const currentRate = player.getPlaybackRate?.() || 1.0;
+
         const action = computeDriftAction({
           expectedPos,
-          actualPos: currentLocal,
+          actualPos: smoothedActualPos,
           isPlaying: Boolean(playback.isPlaying),
-          duration: effectiveDuration
+          duration: effectiveDuration,
+          deadbandSec,
+          exitDeadbandSec,
+          seekThresholdSec,
+          rateDelta,
+          currentRate
         });
 
-        setDriftMs(action.driftMs);
-        const now = Date.now();
+        setDriftMs((prev) => (Math.abs(prev - action.driftMs) >= 25 ? action.driftMs : prev));
 
         if (action.type === 'seek') {
-          if (now - lastSeekAtRef.current > 900) {
+          if (now - lastSeekAtRef.current > seekCooldownMs) {
             lastSeekAtRef.current = now;
-            playerRef.current.seekTo(action.targetPos, 'seconds');
-            playerRef.current.setPlaybackRate?.(1.0);
+            smoothedDriftRef.current = 0;
+            player.seekTo(action.targetPos, 'seconds');
+            player.setPlaybackRate?.(1.0);
           }
         } else if (action.type === 'rate') {
-          playerRef.current.setPlaybackRate?.(action.rate);
+          if (Math.abs(currentRate - action.rate) > 0.002 && now - lastRateChangeAtRef.current > rateCooldownMs) {
+            lastRateChangeAtRef.current = now;
+            player.setPlaybackRate?.(action.rate);
+          }
         } else if (action.type === 'none') {
-          playerRef.current.setPlaybackRate?.(1.0);
+          if (Math.abs(currentRate - 1.0) > 0.002 && now - lastRateChangeAtRef.current > rateCooldownMs) {
+            lastRateChangeAtRef.current = now;
+            player.setPlaybackRate?.(1.0);
+          }
         }
       } catch {}
-    }, 200);
+    }, syncIntervalMs);
 
     return () => clearInterval(interval);
-  }, [currentTrack?.id, playback, effectiveDuration, autoplayBlocked]);
+  }, [currentTrack?.id, playback, effectiveDuration, autoplayBlocked, isMobileDevice]);
 
   // Вспомогательная команда хоста: запуск трека (через барьер готовности или сразу)
   const launchTrackAsHost = useCallback(

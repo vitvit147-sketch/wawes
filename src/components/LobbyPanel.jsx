@@ -1,7 +1,7 @@
 import React from 'react';
-import { Users, Sparkles, CheckCircle2, Download, Radio } from 'lucide-react';
+import { Users, CheckCircle2, Download, Radio } from 'lucide-react';
 
-export default function LobbyPanel({
+const LobbyPanel = React.memo(function LobbyPanel({
   participants = [],
   participantId,
   currentTrack,
@@ -166,13 +166,8 @@ export default function LobbyPanel({
           })}
         </div>
       </div>
-
-      <div className="mt-4 pt-4 border-t border-white/10 text-[11px] text-slate-400 leading-relaxed flex items-center gap-2">
-        <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />
-        <span>
-          Треки сжаты в AAC (~1.8 МБ), скачиваются в оперативную память и стартуют одновременно по NTP-часам без сетевых рывков.
-        </span>
-      </div>
     </section>
   );
-}
+});
+
+export default LobbyPanel;

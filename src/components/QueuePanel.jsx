@@ -27,7 +27,7 @@ import { formatDuration, formatBytes } from '../utils/audioMetadata';
 import { DEMO_PRESETS } from '../utils/mediaUrlResolver';
 import { getTrackCacheStatus } from '../utils/trackLoader';
 
-export default function QueuePanel({
+const QueuePanel = React.memo(function QueuePanel({
   queue = [],
   isHost,
   currentTrack,
@@ -47,6 +47,7 @@ export default function QueuePanel({
   const [selectedTab, setSelectedTab] = useState('hits');
   const [selectedAlbum, setSelectedAlbum] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [showAllCatalog, setShowAllCatalog] = useState(false);
 
   const queueUrlSet = new Set(queue.map((t) => t.url));
   const cachedCount = queue.reduce((acc, t) => {
@@ -335,49 +336,60 @@ export default function QueuePanel({
                   Ничего не найдено по запросу «{searchQuery}»
                 </div>
               ) : (
-                filteredPresets.map((preset) => {
-                  const isAdded = queueUrlSet.has(preset.url);
-                  const isUpNext = nextTrackId === preset.id;
-                  return (
+                <>
+                  {(searchQuery.trim() || showAllCatalog ? filteredPresets : filteredPresets.slice(0, 45)).map((preset) => {
+                    const isAdded = queueUrlSet.has(preset.url);
+                    const isUpNext = nextTrackId === preset.id;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        disabled={isAddingUrl}
+                        onClick={() => handleAddPreset(preset)}
+                        className={`px-2.5 py-1.5 rounded-xl border text-xs font-medium transition-all flex items-center gap-2 cursor-pointer disabled:cursor-default ${
+                          isUpNext
+                            ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
+                            : isAdded
+                            ? 'bg-slate-900/90 border-sky-400/30 text-sky-200 hover:bg-sky-500/20'
+                            : 'bg-slate-950/70 hover:bg-slate-800/80 border-white/10 hover:border-sky-400/40 text-slate-300'
+                        }`}
+                      >
+                        {preset.thumbnail ? (
+                          <img
+                            src={preset.thumbnail}
+                            alt=""
+                            className="w-4 h-4 rounded-md object-cover shrink-0"
+                            loading="lazy"
+                          />
+                        ) : isAdded ? (
+                          <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        ) : (
+                          <Music2 className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                        )}
+                        <span className="truncate max-w-[130px] font-semibold">{preset.title}</span>
+                        {preset.album && (
+                          <span className="text-[10px] text-slate-500 px-1 py-0.2 rounded bg-white/5 shrink-0 hidden sm:inline">
+                            {preset.album}
+                          </span>
+                        )}
+                        {isAdded && (
+                          <span className="text-[10px] text-emerald-400 font-bold shrink-0">
+                            {isUpNext ? '⏭️' : '✓'}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                  {!searchQuery.trim() && !showAllCatalog && filteredPresets.length > 45 && (
                     <button
-                      key={preset.id}
                       type="button"
-                      disabled={isAddingUrl}
-                      onClick={() => handleAddPreset(preset)}
-                      className={`px-2.5 py-1.5 rounded-xl border text-xs font-medium transition-all flex items-center gap-2 cursor-pointer disabled:cursor-default ${
-                        isUpNext
-                          ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
-                          : isAdded
-                          ? 'bg-slate-900/90 border-sky-400/30 text-sky-200 hover:bg-sky-500/20'
-                          : 'bg-slate-950/70 hover:bg-slate-800/80 border-white/10 hover:border-sky-400/40 text-slate-300'
-                      }`}
+                      onClick={() => setShowAllCatalog(true)}
+                      className="px-3 py-1.5 rounded-xl border border-sky-400/30 bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 text-xs font-bold cursor-pointer transition-all"
                     >
-                      {preset.thumbnail ? (
-                        <img
-                          src={preset.thumbnail}
-                          alt=""
-                          className="w-4 h-4 rounded-md object-cover shrink-0"
-                          loading="lazy"
-                        />
-                      ) : isAdded ? (
-                        <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                      ) : (
-                        <Music2 className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                      )}
-                      <span className="truncate max-w-[130px] font-semibold">{preset.title}</span>
-                      {preset.album && (
-                        <span className="text-[10px] text-slate-500 px-1 py-0.2 rounded bg-white/5 shrink-0 hidden sm:inline">
-                          {preset.album}
-                        </span>
-                      )}
-                      {isAdded && (
-                        <span className="text-[10px] text-emerald-400 font-bold shrink-0">
-                          {isUpNext ? '⏭️' : '✓'}
-                        </span>
-                      )}
+                      Показать ещё (+{filteredPresets.length - 45})
                     </button>
-                  );
-                })
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -532,4 +544,6 @@ export default function QueuePanel({
       )}
     </section>
   );
-}
+});
+
+export default QueuePanel;

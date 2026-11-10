@@ -182,3 +182,48 @@ test('buildPrefetchOrder prioritizes upcoming tracks wrapping circularly after c
     ['d', 'a', 'b']
   );
 });
+
+test('computeDriftAction honors Bluetooth/mobile deadband and hysteresis cleanly', () => {
+  // Inside 140ms Bluetooth latency jitter when rate is normal -> does NOT adjust rate
+  const neutralBt = computeDriftAction({
+    expectedPos: 25.12,
+    actualPos: 25.0,
+    isPlaying: true,
+    duration: 180,
+    deadbandSec: 0.14,
+    exitDeadbandSec: 0.055,
+    seekThresholdSec: 0.65,
+    rateDelta: 0.018,
+    currentRate: 1.0
+  });
+  assert.equal(neutralBt.type, 'none');
+
+  // If already catching up (currentRate = 1.018), continues gently until inside exitDeadbandSec (55ms)
+  const stayInRate = computeDriftAction({
+    expectedPos: 25.08,
+    actualPos: 25.0,
+    isPlaying: true,
+    duration: 180,
+    deadbandSec: 0.14,
+    exitDeadbandSec: 0.055,
+    seekThresholdSec: 0.65,
+    rateDelta: 0.018,
+    currentRate: 1.018
+  });
+  assert.equal(stayInRate.type, 'rate');
+  assert.equal(stayInRate.rate, 1.018);
+
+  // Only triggers hard seek beyond 650ms on mobile
+  const softBehind = computeDriftAction({
+    expectedPos: 25.45,
+    actualPos: 25.0,
+    isPlaying: true,
+    duration: 180,
+    deadbandSec: 0.14,
+    exitDeadbandSec: 0.055,
+    seekThresholdSec: 0.65,
+    rateDelta: 0.018,
+    currentRate: 1.0
+  });
+  assert.equal(softBehind.type, 'rate');
+});

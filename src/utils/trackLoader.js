@@ -475,6 +475,10 @@ export function startQueuePrefetchPipeline(tracks = [], maxLookahead = 6) {
         foreground: false,
         skipBlobUrl: !keepInRam
       }).catch(() => null);
+
+      if (!cancelled && i + 1 < limit) {
+        await new Promise((r) => setTimeout(r, 350));
+      }
     }
   })();
 

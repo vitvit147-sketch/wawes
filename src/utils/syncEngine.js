@@ -95,11 +95,19 @@ export function evaluateBarrierReadiness(participants = [], trackId) {
 
 /**
  * Определяет действие коррекции рассинхрона между ожидаемой и локальной позициями плеера.
- * - до 50 мс: идеальный синхрон (не вмешиваемся)
- * - 50..350 мс: плавно подкручиваем playbackRate (0.97 / 1.03) без рывков
- * - > 350 мс: мгновенный seek в RAM (0 мс задержка для Blob URL)
+ * Поддерживает настраиваемые пороги, гистерезис и плавный rate-шаг (для стабильной работы с Bluetooth/Android).
  */
-export function computeDriftAction({ expectedPos, actualPos, isPlaying, duration = 0 }) {
+export function computeDriftAction({
+  expectedPos,
+  actualPos,
+  isPlaying,
+  duration = 0,
+  deadbandSec = 0.05,
+  exitDeadbandSec = 0.035,
+  seekThresholdSec = 0.35,
+  rateDelta = 0.03,
+  currentRate = 1.0
+}) {
   const safeExpected = Math.max(0, Number(expectedPos) || 0);
   const safeActual = Math.max(0, Number(actualPos) || 0);
   const drift = safeExpected - safeActual;
@@ -117,7 +125,7 @@ export function computeDriftAction({ expectedPos, actualPos, isPlaying, duration
     return { type: 'ended', rate: 1.0, driftMs };
   }
 
-  if (absDrift > 0.35) {
+  if (absDrift > seekThresholdSec) {
     return {
       type: 'seek',
       targetPos: duration > 0 ? Math.min(safeExpected, Math.max(0, duration - 0.05)) : safeExpected,
@@ -126,10 +134,14 @@ export function computeDriftAction({ expectedPos, actualPos, isPlaying, duration
     };
   }
 
-  if (absDrift > 0.05) {
+  const isAlreadyAdjusting = Math.abs((Number(currentRate) || 1) - 1) > 0.002;
+  const triggerLimit = isAlreadyAdjusting ? Math.min(deadbandSec, exitDeadbandSec) : deadbandSec;
+
+  if (absDrift > triggerLimit) {
+    const safeDelta = Math.max(0.005, Math.min(0.08, Number(rateDelta) || 0.03));
     return {
       type: 'rate',
-      rate: drift > 0 ? 1.03 : 0.97,
+      rate: Number((drift > 0 ? 1 + safeDelta : 1 - safeDelta).toFixed(3)),
       driftMs
     };
   }
