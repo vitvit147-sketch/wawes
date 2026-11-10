@@ -52,7 +52,7 @@ export default function HomeScreen({
     e?.preventDefault();
     const cleaned = roomCode.trim();
     if (!cleaned) {
-      setErrorMessage('Введите код комнаты (например 4821)');
+      setErrorMessage('Введите код комнаты');
       return;
     }
     setErrorMessage('');
@@ -78,13 +78,13 @@ export default function HomeScreen({
         <div className="text-center mb-7">
           <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-sky-500/15 border border-sky-500/30 text-sky-300 text-xs font-extrabold uppercase tracking-wider mb-3">
             <Sparkles className="w-3.5 h-3.5 text-sky-400" />
-            <span>Watch2Gether · Синхронный плеер</span>
+            <span>Синхронный плеер</span>
           </div>
           <h1 className="text-3xl sm:text-4xl font-black tracking-tight text-white mb-2">
             Wave<span className="text-sky-400">Sync</span>
           </h1>
-          <p className="text-sm sm:text-base text-slate-400 max-w-md mx-auto leading-relaxed">
-            Слушайте музыку и смотрите клипы вместе с друзьями в идеальном синхроне через YouTube, SoundCloud и прямые аудиоссылки.
+          <p className="text-sm text-slate-400 max-w-md mx-auto">
+            Музыка в общем эфире
           </p>
         </div>
 
@@ -123,7 +123,7 @@ export default function HomeScreen({
             value={name}
             onChange={(e) => setName(e.target.value)}
             maxLength={24}
-            placeholder="Ваше имя (например, Дима)"
+            placeholder="Ваше имя"
             className="w-full px-4 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-white placeholder-slate-500 focus:border-sky-500 outline-none font-medium"
           />
         </section>
@@ -173,7 +173,7 @@ export default function HomeScreen({
               inputMode="numeric"
               value={roomCode}
               onChange={(e) => setRoomCode(e.target.value.replace(/\s+/g, '').slice(0, 6))}
-              placeholder="Код (напр. 4821)"
+              placeholder="Код комнаты"
               className="sm:w-44 px-4 py-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-center text-xl font-black tracking-widest font-mono text-sky-300 placeholder-slate-600 focus:border-emerald-500 outline-none"
             />
             <button

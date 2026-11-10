@@ -393,7 +393,6 @@ export default function PlayerCard({
                   ? 'bg-sky-500/15 text-sky-300 border-sky-400/35 hover:bg-sky-500/25'
                   : 'bg-slate-800/80 text-slate-400 border-white/10 hover:text-slate-200'
               }`}
-              title="Если включено — трек стартует одновременно только после полной загрузки на всех устройствах"
             >
               <ShieldCheck className="w-3.5 h-3.5" />
               <span>
@@ -406,12 +405,6 @@ export default function PlayerCard({
         </div>
 
         <div className="flex items-center gap-2 text-xs flex-wrap">
-          {firebaseStatus?.clockCalibrated && firebaseStatus?.clockRttMs !== null && (
-            <span className="hidden sm:inline-flex items-center gap-1 px-2 py-1 rounded-full bg-slate-950/60 border border-white/10 text-[11px] font-mono text-slate-400">
-              NTP ±{Math.max(5, Math.round(firebaseStatus.clockRttMs / 2))} мс
-            </span>
-          )}
-
           <span
             className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-semibold ${
               firebaseStatus.connected
@@ -426,7 +419,7 @@ export default function PlayerCard({
               ? downloadState?.stage === 'downloading'
                 ? `Загрузка ${downloadPct}%`
                 : playback?.phase === 'buffering'
-                ? 'Ждём всех участников...'
+                ? 'Ждём всех...'
                 : countdownMs > 0
                 ? `Старт через ${(countdownMs / 1000).toFixed(1)}с`
                 : isBuffering
@@ -434,8 +427,8 @@ export default function PlayerCard({
                 : !playback?.isPlaying
                 ? 'На паузе'
                 : Math.abs(driftMs) <= 50
-                ? `Идеальный синк (${driftMs >= 0 ? '+' : ''}${driftMs} мс)`
-                : `Подстройка ${driftMs > 0 ? '+' : ''}${driftMs} мс`
+                ? 'Синхронизировано'
+                : 'Подстройка...'
               : firebaseStatus.connected
                 ? 'Онлайн'
                 : 'Подключение...'}

@@ -444,14 +444,16 @@ export function prefetchTrack(rawUrl, expectedSizeBytes = 0) {
 }
 
 /**
- * Последовательно предзагружает всю очередь по приоритету (ближайшие — в RAM, остальные — на диск),
- * не мешая загрузке активного трека. Возвращает функцию отмены при перестроении очереди.
+ * Последовательно предзагружает ближайшие треки очереди по приоритету (следующий — в RAM,
+ * остальные из окна lookahead — на диск в Cache Storage), не перегружая память при длинных плейлистах.
+ * Возвращает функцию отмены при перестроении очереди.
  */
-export function startQueuePrefetchPipeline(tracks = []) {
+export function startQueuePrefetchPipeline(tracks = [], maxLookahead = 6) {
   let cancelled = false;
 
   (async () => {
-    for (let i = 0; i < tracks.length; i++) {
+    const limit = Math.min(tracks.length, Math.max(1, maxLookahead));
+    for (let i = 0; i < limit; i++) {
       if (cancelled) return;
       const track = tracks[i];
       if (!track?.url || track.source === 'soundcloud' || track.source === 'youtube') continue;

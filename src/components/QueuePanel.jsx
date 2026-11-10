@@ -44,7 +44,8 @@ export default function QueuePanel({
 }) {
   const [inputUrl, setInputUrl] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
-  const [selectedTab, setSelectedTab] = useState('all');
+  const [selectedTab, setSelectedTab] = useState('hits');
+  const [selectedAlbum, setSelectedAlbum] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
 
   const queueUrlSet = new Set(queue.map((t) => t.url));
@@ -54,9 +55,38 @@ export default function QueuePanel({
   }, 0);
   const cachePct = queue.length > 0 ? Math.round((cachedCount / queue.length) * 100) : 0;
 
+  const albumList = useMemo(() => {
+    const order = [
+      'KARMA', 'DO IT', '合 (HOP)', 'ATE', '5-STAR', 'ROCK-STAR',
+      'MAXIDENT', 'CIRCUS', 'ODDINARY', 'NOEASY', 'ALL IN',
+      'IN生 (IN LIFE)', 'GO生 (GO LIVE)', 'Clé : LEVANTER',
+      'Yellow Wood', 'Clé 1 : MIROH', 'I am YOU', 'I am WHO', 'I am NOT', 'Mixtape'
+    ];
+    const counts = new Map();
+    for (const p of DEMO_PRESETS) {
+      if (!p.album || p.album === '3RACHA') continue;
+      counts.set(p.album, (counts.get(p.album) || 0) + 1);
+    }
+    return [...counts.entries()]
+      .sort((a, b) => {
+        const ia = order.indexOf(a[0]);
+        const ib = order.indexOf(b[0]);
+        return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+      })
+      .map(([name, count]) => ({ name, count }));
+  }, []);
+
   const filteredPresets = useMemo(() => {
     return DEMO_PRESETS.filter((p) => {
-      if (selectedTab !== 'all' && p.category !== selectedTab) return false;
+      if (selectedTab === 'albums') {
+        if (selectedAlbum !== 'all') {
+          if (p.album !== selectedAlbum) return false;
+        } else if (p.category === '3racha') {
+          return false;
+        }
+      } else if (selectedTab !== 'all' && p.category !== selectedTab) {
+        return false;
+      }
       if (!searchQuery.trim()) return true;
       const q = searchQuery.toLowerCase().trim();
       return (
@@ -65,13 +95,14 @@ export default function QueuePanel({
         p.artist.toLowerCase().includes(q)
       );
     });
-  }, [selectedTab, searchQuery]);
+  }, [selectedTab, selectedAlbum, searchQuery]);
 
   const tabCounts = useMemo(() => ({
     all: DEMO_PRESETS.length,
     hits: DEMO_PRESETS.filter((p) => p.category === 'hits').length,
-    albums: DEMO_PRESETS.filter((p) => p.category === 'albums').length,
-    solo: DEMO_PRESETS.filter((p) => p.category === 'solo').length
+    albums: DEMO_PRESETS.filter((p) => p.category !== '3racha').length,
+    solo: DEMO_PRESETS.filter((p) => p.category === 'solo').length,
+    racha: DEMO_PRESETS.filter((p) => p.category === '3racha').length
   }), []);
 
   const handleSubmit = async (e) => {
@@ -113,7 +144,6 @@ export default function QueuePanel({
                   ? 'bg-emerald-500/15 border-emerald-400/30 text-emerald-300'
                   : 'bg-sky-500/15 border-sky-400/30 text-sky-300'
               }`}
-              title="Количество треков очереди, уже скачанных в локальный кэш этого устройства"
             >
               ⚡ Кэш: {cachedCount}/{queue.length}
             </span>
@@ -172,18 +202,7 @@ export default function QueuePanel({
             <div className="flex items-center gap-1.5 overflow-x-auto pb-1 mb-2.5 scrollbar-none">
               <button
                 type="button"
-                onClick={() => setSelectedTab('all')}
-                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
-                  selectedTab === 'all'
-                    ? 'bg-sky-500 text-white shadow-md shadow-sky-500/20'
-                    : 'bg-slate-950/70 text-slate-400 hover:text-white hover:bg-slate-800 border border-white/5'
-                }`}
-              >
-                Все ({tabCounts.all})
-              </button>
-              <button
-                type="button"
-                onClick={() => setSelectedTab('hits')}
+                onClick={() => { setSelectedTab('hits'); setSelectedAlbum('all'); }}
                 className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
                   selectedTab === 'hits'
                     ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/20'
@@ -207,7 +226,7 @@ export default function QueuePanel({
               </button>
               <button
                 type="button"
-                onClick={() => setSelectedTab('solo')}
+                onClick={() => { setSelectedTab('solo'); setSelectedAlbum('all'); }}
                 className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
                   selectedTab === 'solo'
                     ? 'bg-emerald-500 text-white shadow-md shadow-emerald-500/20'
@@ -215,9 +234,63 @@ export default function QueuePanel({
                 }`}
               >
                 <Mic2 className="w-3.5 h-3.5" />
-                <span>Соло & Юниты ({tabCounts.solo})</span>
+                <span>Соло ({tabCounts.solo})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => { setSelectedTab('3racha'); setSelectedAlbum('all'); }}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
+                  selectedTab === '3racha'
+                    ? 'bg-fuchsia-500 text-white shadow-md shadow-fuchsia-500/20'
+                    : 'bg-slate-950/70 text-slate-400 hover:text-white hover:bg-slate-800 border border-white/5'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>3RACHA ({tabCounts.racha})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => { setSelectedTab('all'); setSelectedAlbum('all'); }}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                  selectedTab === 'all'
+                    ? 'bg-sky-500 text-white shadow-md shadow-sky-500/20'
+                    : 'bg-slate-950/70 text-slate-400 hover:text-white hover:bg-slate-800 border border-white/5'
+                }`}
+              >
+                Все ({tabCounts.all})
               </button>
             </div>
+
+            {/* Фильтр по конкретному альбому */}
+            {selectedTab === 'albums' && albumList.length > 0 && (
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-1.5 mb-2 scrollbar-none">
+                <button
+                  type="button"
+                  onClick={() => setSelectedAlbum('all')}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                    selectedAlbum === 'all'
+                      ? 'bg-indigo-400/25 text-indigo-200 border border-indigo-400/50'
+                      : 'bg-slate-950/60 text-slate-400 hover:text-white border border-white/5'
+                  }`}
+                >
+                  Все альбомы
+                </button>
+                {albumList.map((alb) => (
+                  <button
+                    key={alb.name}
+                    type="button"
+                    onClick={() => setSelectedAlbum(alb.name)}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                      selectedAlbum === alb.name
+                        ? 'bg-indigo-400/25 text-indigo-200 border border-indigo-400/50'
+                        : 'bg-slate-950/60 text-slate-400 hover:text-white border border-white/5'
+                    }`}
+                  >
+                    {alb.name} ({alb.count})
+                  </button>
+                ))}
+              </div>
+            )}
 
             {/* Строка поиска и кнопка пакетного добавления */}
             <div className="flex items-center gap-2 mb-2.5">
@@ -227,7 +300,7 @@ export default function QueuePanel({
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Поиск по треку, соло или альбому..."
+                  placeholder="Поиск трека или альбома..."
                   className="w-full pl-9 pr-8 py-2 rounded-xl bg-slate-950/90 border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
                 />
                 {searchQuery && (
@@ -256,7 +329,7 @@ export default function QueuePanel({
             </div>
 
             {/* Сетка карточек треков каталога */}
-            <div className="flex flex-wrap gap-1.5 max-h-44 overflow-y-auto pr-1">
+            <div className="flex flex-wrap gap-1.5 max-h-56 overflow-y-auto pr-1">
               {filteredPresets.length === 0 ? (
                 <div className="w-full py-4 text-center text-xs text-slate-500">
                   Ничего не найдено по запросу «{searchQuery}»
@@ -419,7 +492,6 @@ export default function QueuePanel({
                         type="button"
                         onClick={() => onPlayNextInQueue(track.id)}
                         className="px-2 py-1.5 rounded-lg bg-sky-500/15 hover:bg-sky-500/30 border border-sky-400/25 text-sky-300 text-[11px] font-bold flex items-center gap-1 transition-all cursor-pointer"
-                        title="Поставить следующим треком (предзагрузится у всех заранее)"
                       >
                         <ListStart className="w-3.5 h-3.5" />
                         <span className="hidden sm:inline">След.</span>
