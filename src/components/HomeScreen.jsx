@@ -136,8 +136,8 @@ export default function HomeScreen({
             </div>
             <div>
               <h2 className="text-lg font-extrabold text-white">Создать комнату (Хост)</h2>
-              <p className="text-xs sm:text-sm text-slate-300 mt-0.5 leading-relaxed">
-                Вы создаёте плейлист и управляете воспроизведением. Друзья подключаются по коду и слушают секунда в секунду.
+              <p className="text-xs sm:text-sm text-slate-300 mt-0.5">
+                Управление воспроизведением и плейлистом
               </p>
             </div>
           </div>
@@ -162,7 +162,7 @@ export default function HomeScreen({
             <div>
               <h2 className="text-lg font-extrabold text-white">Подключиться к комнате</h2>
               <p className="text-xs sm:text-sm text-slate-400 mt-0.5">
-                Введите 4-значный номер комнаты от хоста — трек заиграет синхронно.
+                Вход по номеру комнаты
               </p>
             </div>
           </div>
@@ -193,16 +193,12 @@ export default function HomeScreen({
           {firebaseStatus.connected ? (
             <span className="inline-flex items-center gap-1.5 text-emerald-400 font-semibold">
               <Wifi className="w-3.5 h-3.5" />
-              Сервер синхронизации онлайн (
-              {firebaseStatus.clockCalibrated && firebaseStatus.clockRttMs !== null
-                ? `NTP ±${Math.max(5, Math.round(firebaseStatus.clockRttMs / 2))} мс`
-                : `offset ${Math.round(firebaseStatus.serverTimeOffsetMs)} мс`}
-              )
+              Сервер онлайн
             </span>
           ) : (
             <span className="inline-flex items-center gap-1.5 text-amber-400 font-semibold">
               <WifiOff className="w-3.5 h-3.5" />
-              Подключение к серверу синхронизации...
+              Подключение к серверу...
             </span>
           )}
         </div>
@@ -212,11 +208,6 @@ export default function HomeScreen({
           <span>YouTube · SoundCloud · Audio</span>
         </div>
       </footer>
-
-      <div className="w-full max-w-lg mx-auto mt-2 px-1 text-[11px] text-slate-500 flex items-center gap-1.5">
-        <ShieldCheck className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-        <span>Работает на любых смартфонах и ПК без ограничений провайдеров и NAT.</span>
-      </div>
     </div>
   );
 }

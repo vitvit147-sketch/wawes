@@ -25,7 +25,7 @@ export default function LobbyPanel({
           </div>
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/25 text-xs font-semibold">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            NTP + RAM
+            Синхрон
           </span>
         </div>
 
@@ -47,23 +47,23 @@ export default function LobbyPanel({
               statusText = 'Отключён';
               statusTone = 'text-slate-500';
             } else if (!trackId) {
-              statusText = p.isHost ? 'Ведущий · ждёт треки' : 'На связи';
+              statusText = p.isHost ? 'Ведущий' : 'На связи';
               statusTone = p.isHost ? 'text-sky-400' : 'text-slate-300';
             } else if (p.status === 'downloading' && !isReadyForTrack) {
-              statusText = `Скачивает трек · ${pct}%`;
+              statusText = `Загрузка · ${pct}%`;
               statusTone = 'text-sky-300';
             } else if (p.status === 'direct-stream' && isReadyForTrack) {
-              statusText = 'Прямой поток (без кэша)';
+              statusText = 'Прямой поток';
               statusTone = 'text-amber-300';
             } else if (isReadyForTrack) {
               if (isBufferingPhase) {
-                statusText = 'Готов (100% в RAM)';
+                statusText = 'Готов к старту';
                 statusTone = 'text-emerald-300';
               } else if (isPlaying) {
-                statusText = p.isHost ? 'Ведёт эфир ▶ (100% в RAM)' : 'Синхронно в RAM ▶';
+                statusText = p.isHost ? 'Ведёт эфир ▶' : 'В эфире ▶';
                 statusTone = 'text-emerald-400';
               } else {
-                statusText = 'Готов в RAM (пауза)';
+                statusText = 'Готов (пауза)';
                 statusTone = 'text-sky-300';
               }
             } else {
@@ -143,11 +143,11 @@ export default function LobbyPanel({
                     {nextTrack?.id ? (
                       isNextReady ? (
                         <span className="text-emerald-300 font-bold">
-                          ⏭️ След. трек готов ⚡
+                          ⏭️ След. трек готов
                         </span>
                       ) : (
                         <span className="text-sky-300/80 font-medium">
-                          ⬇️ Предзагрузка след. трека...
+                          ⬇️ Предзагрузка...
                         </span>
                       )
                     ) : (

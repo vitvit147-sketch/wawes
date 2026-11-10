@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   Music2,
   Plus,
@@ -8,7 +8,12 @@ import {
   Loader2,
   Sparkles,
   ListStart,
-  Check
+  Check,
+  Search,
+  Flame,
+  Disc,
+  Mic2,
+  X
 } from 'lucide-react';
 
 function YouTubeIcon({ className = "w-3 h-3 text-red-400" }) {
@@ -39,6 +44,8 @@ export default function QueuePanel({
 }) {
   const [inputUrl, setInputUrl] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [selectedTab, setSelectedTab] = useState('all');
+  const [searchQuery, setSearchQuery] = useState('');
 
   const queueUrlSet = new Set(queue.map((t) => t.url));
   const cachedCount = queue.reduce((acc, t) => {
@@ -46,6 +53,26 @@ export default function QueuePanel({
     return acc + (getTrackCacheStatus(t.url).isReady ? 1 : 0);
   }, 0);
   const cachePct = queue.length > 0 ? Math.round((cachedCount / queue.length) * 100) : 0;
+
+  const filteredPresets = useMemo(() => {
+    return DEMO_PRESETS.filter((p) => {
+      if (selectedTab !== 'all' && p.category !== selectedTab) return false;
+      if (!searchQuery.trim()) return true;
+      const q = searchQuery.toLowerCase().trim();
+      return (
+        p.title.toLowerCase().includes(q) ||
+        (p.album && p.album.toLowerCase().includes(q)) ||
+        p.artist.toLowerCase().includes(q)
+      );
+    });
+  }, [selectedTab, searchQuery]);
+
+  const tabCounts = useMemo(() => ({
+    all: DEMO_PRESETS.length,
+    hits: DEMO_PRESETS.filter((p) => p.category === 'hits').length,
+    albums: DEMO_PRESETS.filter((p) => p.category === 'albums').length,
+    solo: DEMO_PRESETS.filter((p) => p.category === 'solo').length
+  }), []);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -139,72 +166,155 @@ export default function QueuePanel({
             <p className="text-xs text-rose-400 mt-2 px-1 font-semibold">{errorMsg}</p>
           )}
 
-          {/* Быстрые пресеты для теста */}
-          <div className="mt-3">
-            <div className="flex items-center justify-between gap-1.5 text-xs text-slate-400 font-semibold mb-2 flex-wrap">
-              <div className="flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                <span>Готовые треки Stray Kids ({DEMO_PRESETS.length}):</span>
+          {/* Каталог Stray Kids с вкладками и мгновенным поиском */}
+          <div className="mt-3.5 pt-3.5 border-t border-white/5">
+            {/* Вкладки категорий */}
+            <div className="flex items-center gap-1.5 overflow-x-auto pb-1 mb-2.5 scrollbar-none">
+              <button
+                type="button"
+                onClick={() => setSelectedTab('all')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                  selectedTab === 'all'
+                    ? 'bg-sky-500 text-white shadow-md shadow-sky-500/20'
+                    : 'bg-slate-950/70 text-slate-400 hover:text-white hover:bg-slate-800 border border-white/5'
+                }`}
+              >
+                Все ({tabCounts.all})
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedTab('hits')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
+                  selectedTab === 'hits'
+                    ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/20'
+                    : 'bg-slate-950/70 text-slate-400 hover:text-white hover:bg-slate-800 border border-white/5'
+                }`}
+              >
+                <Flame className="w-3.5 h-3.5" />
+                <span>Хиты ({tabCounts.hits})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedTab('albums')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
+                  selectedTab === 'albums'
+                    ? 'bg-indigo-500 text-white shadow-md shadow-indigo-500/20'
+                    : 'bg-slate-950/70 text-slate-400 hover:text-white hover:bg-slate-800 border border-white/5'
+                }`}
+              >
+                <Disc className="w-3.5 h-3.5" />
+                <span>Альбомы ({tabCounts.albums})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedTab('solo')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
+                  selectedTab === 'solo'
+                    ? 'bg-emerald-500 text-white shadow-md shadow-emerald-500/20'
+                    : 'bg-slate-950/70 text-slate-400 hover:text-white hover:bg-slate-800 border border-white/5'
+                }`}
+              >
+                <Mic2 className="w-3.5 h-3.5" />
+                <span>Соло & Юниты ({tabCounts.solo})</span>
+              </button>
+            </div>
+
+            {/* Строка поиска и кнопка пакетного добавления */}
+            <div className="flex items-center gap-2 mb-2.5">
+              <div className="relative flex-1">
+                <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Поиск по треку, соло или альбому..."
+                  className="w-full pl-9 pr-8 py-2 rounded-xl bg-slate-950/90 border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white p-0.5 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
-              {onAddBatchTracks && (
+
+              {onAddBatchTracks && filteredPresets.length > 0 && (
                 <button
                   type="button"
                   disabled={isAddingUrl}
                   onClick={async () => {
-                    await onAddBatchTracks(DEMO_PRESETS);
+                    await onAddBatchTracks(filteredPresets);
                   }}
-                  className="px-2.5 py-1 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-400/30 text-[11px] font-bold cursor-pointer transition-all active:scale-95"
+                  className="px-3 py-2 rounded-xl bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-400/30 text-xs font-bold cursor-pointer transition-all active:scale-95 whitespace-nowrap shrink-0"
                 >
-                  ⚡ Добавить все {DEMO_PRESETS.length} в очередь
+                  ⚡ Добавить ({filteredPresets.length})
                 </button>
               )}
             </div>
-            <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto pr-1">
-              {DEMO_PRESETS.map((preset, idx) => {
-                const isAdded = queueUrlSet.has(preset.url);
-                const isUpNext = nextTrackId === preset.id;
-                return (
-                  <button
-                    key={idx}
-                    type="button"
-                    disabled={isAddingUrl}
-                    onClick={() => handleAddPreset(preset)}
-                    title={
-                      isAdded
-                        ? 'Уже в очереди — нажмите, чтобы поставить «Следующим» и предзагрузить заранее'
-                        : 'Добавить в очередь'
-                    }
-                    className={`px-2.5 py-1.5 rounded-xl border text-xs font-medium transition-all flex items-center gap-1.5 cursor-pointer disabled:cursor-default ${
-                      isUpNext
-                        ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
-                        : isAdded
-                        ? 'bg-slate-900/90 border-sky-400/30 text-sky-200 hover:bg-sky-500/20'
-                        : 'bg-slate-950/70 hover:bg-slate-800/80 border-white/10 hover:border-sky-400/40 text-slate-300'
-                    }`}
-                  >
-                    {isAdded ? (
-                      <Check className="w-3 h-3 text-emerald-400 shrink-0" />
-                    ) : (
-                      <Music2 className="w-3 h-3 text-sky-400 shrink-0" />
-                    )}
-                    <span className="truncate max-w-[130px]">{preset.title}</span>
-                  </button>
-                );
-              })}
+
+            {/* Сетка карточек треков каталога */}
+            <div className="flex flex-wrap gap-1.5 max-h-44 overflow-y-auto pr-1">
+              {filteredPresets.length === 0 ? (
+                <div className="w-full py-4 text-center text-xs text-slate-500">
+                  Ничего не найдено по запросу «{searchQuery}»
+                </div>
+              ) : (
+                filteredPresets.map((preset) => {
+                  const isAdded = queueUrlSet.has(preset.url);
+                  const isUpNext = nextTrackId === preset.id;
+                  return (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      disabled={isAddingUrl}
+                      onClick={() => handleAddPreset(preset)}
+                      className={`px-2.5 py-1.5 rounded-xl border text-xs font-medium transition-all flex items-center gap-2 cursor-pointer disabled:cursor-default ${
+                        isUpNext
+                          ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
+                          : isAdded
+                          ? 'bg-slate-900/90 border-sky-400/30 text-sky-200 hover:bg-sky-500/20'
+                          : 'bg-slate-950/70 hover:bg-slate-800/80 border-white/10 hover:border-sky-400/40 text-slate-300'
+                      }`}
+                    >
+                      {preset.thumbnail ? (
+                        <img
+                          src={preset.thumbnail}
+                          alt=""
+                          className="w-4 h-4 rounded-md object-cover shrink-0"
+                          loading="lazy"
+                        />
+                      ) : isAdded ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      ) : (
+                        <Music2 className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                      )}
+                      <span className="truncate max-w-[130px] font-semibold">{preset.title}</span>
+                      {preset.album && (
+                        <span className="text-[10px] text-slate-500 px-1 py-0.2 rounded bg-white/5 shrink-0 hidden sm:inline">
+                          {preset.album}
+                        </span>
+                      )}
+                      {isAdded && (
+                        <span className="text-[10px] text-emerald-400 font-bold shrink-0">
+                          {isUpNext ? '⏭️' : '✓'}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })
+              )}
             </div>
-            <p className="text-[11px] text-slate-500 mt-1.5">
-              Совет: нажмите на любой добавленный трек (✓) или кнопку «След.» ниже — и он сразу предзагрузится у всех заранее.
-            </p>
           </div>
         </div>
       )}
 
       {/* Список треков */}
       {queue.length === 0 ? (
-        <div className="py-12 text-center text-sm text-slate-500 rounded-2xl bg-slate-950/30 border border-dashed border-white/5">
-          {isHost
-            ? 'Очередь пока пуста — вставьте ссылку выше или нажмите на любой готовый трек!'
-            : 'Хост пока не добавил треки в комнату.'}
+        <div className="py-10 text-center text-sm text-slate-500 rounded-2xl bg-slate-950/30 border border-dashed border-white/5">
+          {isHost ? 'В очереди пока нет треков' : 'Ожидание музыки от ведущего'}
         </div>
       ) : (
         <div className="space-y-2.5 max-h-[460px] overflow-y-auto pr-1">

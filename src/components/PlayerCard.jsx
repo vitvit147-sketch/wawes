@@ -508,14 +508,12 @@ export default function PlayerCard({
                     ) : isMemoryCached ? (
                       <>
                         <Zap className="w-3.5 h-3.5 text-emerald-400" />
-                        <span className="text-emerald-300">
-                          В памяти (0 мс){downloadState.fromCache ? ' · Кэш' : ''}
-                        </span>
+                        <span className="text-emerald-300">В памяти</span>
                       </>
                     ) : (
                       <>
                         <Music className="w-3.5 h-3.5 text-sky-400" />
-                        <span>Аудиопоток</span>
+                        <span>Аудио</span>
                       </>
                     )}
                   </span>
@@ -534,12 +532,12 @@ export default function PlayerCard({
             ) : (
               <>
                 <h2 className="text-lg sm:text-xl font-extrabold text-slate-300">
-                  {isHost ? 'Добавьте музыку в очередь' : 'Ожидаем музыку от хоста'}
+                  {isHost ? 'Выберите трек для воспроизведения' : 'Ожидание музыки'}
                 </h2>
                 <p className="text-xs sm:text-sm text-slate-400 mt-1">
                   {isHost
-                    ? 'Нажмите «Добавить все 20» или вставьте ссылку на MP3/M4A/SoundCloud.'
-                    : 'Когда хост включит трек, оба устройства сначала скачают его в память, затем стартуют секунда в секунду.'}
+                    ? 'Выберите трек из каталога ниже или вставьте прямую ссылку.'
+                    : 'Воспроизведение начнётся синхронно после выбора трека ведущим.'}
                 </p>
               </>
             )}
@@ -560,14 +558,14 @@ export default function PlayerCard({
             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-400/30 text-emerald-300 font-bold shrink-0">
               <Zap className="w-3 h-3" />
               <span>
-                Предзагружен у всех ({nextTrackPrefetchInfo.readyCount}/{nextTrackPrefetchInfo.onlineCount})
+                Готов ({nextTrackPrefetchInfo.readyCount}/{nextTrackPrefetchInfo.onlineCount})
               </span>
             </span>
           ) : (
             <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-sky-500/15 border border-sky-400/30 text-sky-300 font-semibold shrink-0">
               <Download className="w-3 h-3 animate-pulse" />
               <span>
-                Фон-загрузка ({nextTrackPrefetchInfo.readyCount}/{nextTrackPrefetchInfo.onlineCount})
+                Загрузка ({nextTrackPrefetchInfo.readyCount}/{nextTrackPrefetchInfo.onlineCount})
               </span>
             </span>
           )}
@@ -583,14 +581,14 @@ export default function PlayerCard({
                 <>
                   <Clock className="w-4 h-4 text-emerald-400 animate-spin shrink-0" />
                   <span className="text-emerald-300 truncate">
-                    Все готовы! Одновременный старт через {(countdownMs / 1000).toFixed(1)}с...
+                    Старт через {(countdownMs / 1000).toFixed(1)}с...
                   </span>
                 </>
               ) : downloadState?.stage === 'downloading' ? (
                 <>
                   <Download className="w-4 h-4 text-sky-400 animate-bounce shrink-0" />
                   <span className="truncate">
-                    Предзагрузка в память: {downloadPct}%
+                    Загрузка: {downloadPct}%
                     {downloadState.totalBytes > 0 &&
                       ` (${formatBytes(downloadState.loadedBytes)} / ${formatBytes(downloadState.totalBytes)})`}
                   </span>
@@ -599,12 +597,12 @@ export default function PlayerCard({
                 <>
                   <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                   <span className="text-emerald-300 truncate">
-                    У вас 100% · Ждём{' '}
+                    Ждём:{' '}
                     {barrierState?.waitingParticipants?.length > 0
                       ? barrierState.waitingParticipants
                           .map((w) => `${w.name} (${w.progress}%)`)
                           .join(', ')
-                      : 'старт комнаты...'}
+                      : 'синхронизацию...'}
                   </span>
                 </>
               )}
@@ -753,10 +751,10 @@ export default function PlayerCard({
             />
             <span>
               {playback?.phase === 'buffering'
-                ? 'Синхронная предзагрузка...'
+                ? 'Подготовка...'
                 : playback?.isPlaying
-                ? 'В эфире (управляет хост)'
-                : 'Пауза у хоста'}
+                ? 'В эфире'
+                : 'Пауза'}
             </span>
           </div>
         )}
