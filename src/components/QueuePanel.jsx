@@ -18,8 +18,9 @@ function YouTubeIcon({ className = "w-3 h-3 text-red-400" }) {
     </svg>
   );
 }
-import { formatDuration } from '../utils/audioMetadata';
+import { formatDuration, formatBytes } from '../utils/audioMetadata';
 import { DEMO_PRESETS } from '../utils/mediaUrlResolver';
+import { isTrackCachedInMemory } from '../utils/trackLoader';
 
 export default function QueuePanel({
   queue = [],
@@ -156,6 +157,7 @@ export default function QueuePanel({
             const isActive = track.id === currentTrack?.id;
             const isYouTube = track.source === 'youtube';
             const isSoundCloud = track.source === 'soundcloud';
+            const inMemory = isTrackCachedInMemory(track.url);
 
             return (
               <div
@@ -205,13 +207,24 @@ export default function QueuePanel({
                       <span className="truncate max-w-[150px]">{track.artist}</span>
                       <span>·</span>
                       <span className="font-semibold text-sky-300">
-                        {isYouTube ? 'YouTube' : isSoundCloud ? 'SoundCloud' : 'Аудио'}
+                        {isYouTube ? 'YouTube' : isSoundCloud ? 'SoundCloud' : 'AAC/Audio'}
                       </span>
                       {track.duration > 0 && (
                         <>
                           <span>·</span>
                           <span>{formatDuration(track.duration)}</span>
                         </>
+                      )}
+                      {track.sizeBytes > 0 && (
+                        <>
+                          <span>·</span>
+                          <span>{formatBytes(track.sizeBytes)}</span>
+                        </>
+                      )}
+                      {inMemory && (
+                        <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-bold text-[10px]">
+                          ⚡ В RAM
+                        </span>
                       )}
                     </div>
                   </div>

@@ -193,7 +193,11 @@ export default function HomeScreen({
           {firebaseStatus.connected ? (
             <span className="inline-flex items-center gap-1.5 text-emerald-400 font-semibold">
               <Wifi className="w-3.5 h-3.5" />
-              Сервер синхронизации онлайн (offset {Math.round(firebaseStatus.serverTimeOffsetMs)} мс)
+              Сервер синхронизации онлайн (
+              {firebaseStatus.clockCalibrated && firebaseStatus.clockRttMs !== null
+                ? `NTP ±${Math.max(5, Math.round(firebaseStatus.clockRttMs / 2))} мс`
+                : `offset ${Math.round(firebaseStatus.serverTimeOffsetMs)} мс`}
+              )
             </span>
           ) : (
             <span className="inline-flex items-center gap-1.5 text-amber-400 font-semibold">

@@ -1,9 +1,15 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { ArrowLeft, Share2, Music2 } from 'lucide-react';
-import { getServerNow } from '../utils/firebase';
+import { ArrowLeft, Share2 } from 'lucide-react';
+import { getServerNow, calibrateServerClock } from '../utils/firebase';
 import { musicRoomClient } from '../utils/musicRoomClient';
-import { computeExpectedPosition, computeDriftAction } from '../utils/syncEngine';
+import {
+  computeExpectedPosition,
+  computeDriftAction,
+  getStartCountdownMs,
+  evaluateBarrierReadiness
+} from '../utils/syncEngine';
 import { resolveTrackMetadata } from '../utils/mediaUrlResolver';
+import { loadTrackToBlobUrl, prefetchTrack, setPinnedUrls } from '../utils/trackLoader';
 import PlayerCard from './PlayerCard';
 import QueuePanel from './QueuePanel';
 import LobbyPanel from './LobbyPanel';
@@ -23,6 +29,7 @@ export default function RoomScreen({
   const [displayTime, setDisplayTime] = useState(0);
   const [playerDuration, setPlayerDuration] = useState(0);
   const [driftMs, setDriftMs] = useState(0);
+  const [countdownMs, setCountdownMs] = useState(0);
   const [volume, setVolume] = useState(() => {
     const saved = Number(localStorage.getItem('wavesync_volume'));
     return Number.isFinite(saved) && saved >= 0 && saved <= 1 ? saved : 0.85;
@@ -32,18 +39,27 @@ export default function RoomScreen({
   const [isBuffering, setIsBuffering] = useState(false);
   const [isAddingUrl, setIsAddingUrl] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
+  const [downloadState, setDownloadState] = useState({
+    trackId: null,
+    stage: 'idle',
+    percent: 0,
+    loadedBytes: 0,
+    totalBytes: 0,
+    speedBps: 0,
+    fromCache: false,
+    playableUrl: null,
+    mode: 'memory'
+  });
 
   const isSeekingRef = useRef(false);
   const advancingNonceRef = useRef(null);
-  const lastLoadedTrackIdRef = useRef(null);
+  const launchedBarrierNonceRef = useRef(null);
   const lastSeekAtRef = useRef(0);
-  const trackSwitchGraceUntilRef = useRef(0);
   const isBufferingRef = useRef(false);
-  const isReadyRef = useRef(false);
 
   const queue = room?.queue || [];
   const playback = room?.playback || {};
-  const settings = room?.settings || { repeatMode: 'all' };
+  const settings = room?.settings || { repeatMode: 'all', waitForListeners: true };
   const participants = room?.participants || [];
 
   const currentTrackIndex = useMemo(
@@ -51,8 +67,22 @@ export default function RoomScreen({
     [queue, playback.trackId]
   );
   const currentTrack = currentTrackIndex >= 0 ? queue[currentTrackIndex] : null;
+  const nextTrack = useMemo(() => {
+    if (queue.length <= 1 || currentTrackIndex < 0) return null;
+    return queue[(currentTrackIndex + 1) % queue.length];
+  }, [queue, currentTrackIndex]);
 
   const effectiveDuration = playerDuration || currentTrack?.duration || 0;
+
+  const barrierState = useMemo(
+    () => evaluateBarrierReadiness(participants, currentTrack?.id),
+    [participants, currentTrack?.id]
+  );
+
+  // Высокоточная NTP-калибровка часов сразу при входе в комнату
+  useEffect(() => {
+    calibrateServerClock(participantId).catch(() => {});
+  }, [participantId, room?.code]);
 
   // Сохранение громкости в localStorage
   useEffect(() => {
@@ -70,93 +100,302 @@ export default function RoomScreen({
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
   }, [isHost, queue.length]);
 
-  // Смена трека: если сменился trackId, сбрасываем время и ставим защитный интервал
+  // Сброс локальной длительности при смене трека
   useEffect(() => {
-    if (!currentTrack) return;
-    if (lastLoadedTrackIdRef.current !== currentTrack.id) {
-      lastLoadedTrackIdRef.current = currentTrack.id;
-      isReadyRef.current = false;
-      isBufferingRef.current = false;
-      setIsBuffering(false);
-      // Защитный период 2.5 сек: плеер спокойно скачивает и начинает новый трек без рывков и перемоток
-      trackSwitchGraceUntilRef.current = Date.now() + 2500;
-      lastSeekAtRef.current = Date.now() + 2500;
-      const initialPos = playback.anchorPos || 0;
-      setDisplayTime(initialPos);
-    }
-  }, [currentTrack?.id, playback.anchorPos]);
+    setPlayerDuration(0);
+    setDisplayTime(playback.anchorPos || 0);
+    setDriftMs(0);
+  }, [currentTrack?.id]);
 
-  // Безопасный цикл синхронизации с умной микро-подгонкой скорости (без заикания)
+  // Плавная потоковая предзагрузка текущего трека в RAM + публикация % готовности в комнату
   useEffect(() => {
-    if (!currentTrack) return;
+    const code = room?.code;
+    if (!code || !currentTrack) return;
+
+    let cancelled = false;
+    let lastReportAt = 0;
+
+    // SoundCloud / YouTube не скачиваются fetch-потоком — сразу отмечаем готовность
+    if (currentTrack.source === 'soundcloud' || currentTrack.source === 'youtube') {
+      setDownloadState({
+        trackId: currentTrack.id,
+        stage: 'ready',
+        percent: 100,
+        loadedBytes: 0,
+        totalBytes: 0,
+        speedBps: 0,
+        fromCache: false,
+        playableUrl: currentTrack.url,
+        mode: 'direct-stream'
+      });
+      musicRoomClient
+        .updateParticipantStatus(code, participantId, {
+          status: 'ready',
+          readyTrackId: currentTrack.id,
+          downloadProgress: 100
+        })
+        .catch(() => {});
+      return;
+    }
+
+    setDownloadState({
+      trackId: currentTrack.id,
+      stage: 'downloading',
+      percent: 0,
+      loadedBytes: 0,
+      totalBytes: currentTrack.sizeBytes || 0,
+      speedBps: 0,
+      fromCache: false,
+      playableUrl: null,
+      mode: 'memory'
+    });
+
+    musicRoomClient
+      .updateParticipantStatus(code, participantId, {
+        status: 'downloading',
+        readyTrackId: null,
+        downloadProgress: 0
+      })
+      .catch(() => {});
+
+    loadTrackToBlobUrl(currentTrack.url, {
+      expectedSizeBytes: currentTrack.sizeBytes || 0,
+      onProgress: (p) => {
+        if (cancelled) return;
+        setDownloadState((prev) => ({
+          ...prev,
+          trackId: currentTrack.id,
+          stage: p.stage,
+          percent: p.percent,
+          loadedBytes: p.loadedBytes,
+          totalBytes: p.totalBytes || prev.totalBytes,
+          speedBps: p.speedBps,
+          fromCache: p.fromCache
+        }));
+
+        const now = Date.now();
+        if (p.percent < 100 && now - lastReportAt >= 320) {
+          lastReportAt = now;
+          musicRoomClient
+            .updateParticipantStatus(code, participantId, {
+              status: 'downloading',
+              readyTrackId: null,
+              downloadProgress: p.percent
+            })
+            .catch(() => {});
+        }
+      }
+    })
+      .then((res) => {
+        if (cancelled) return;
+        const isDirect = res.mode === 'direct-stream';
+        setDownloadState({
+          trackId: currentTrack.id,
+          stage: isDirect ? 'direct-stream' : 'ready',
+          percent: 100,
+          loadedBytes: res.sizeBytes || currentTrack.sizeBytes || 0,
+          totalBytes: res.sizeBytes || currentTrack.sizeBytes || 0,
+          speedBps: 0,
+          fromCache: Boolean(res.fromCache),
+          playableUrl: res.playableUrl,
+          mode: res.mode
+        });
+
+        musicRoomClient
+          .updateParticipantStatus(code, participantId, {
+            status: isDirect ? 'direct-stream' : 'ready',
+            readyTrackId: currentTrack.id,
+            downloadProgress: 100
+          })
+          .catch(() => {});
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.error('Failed to preload track:', err);
+        setDownloadState((prev) => ({
+          ...prev,
+          trackId: currentTrack.id,
+          stage: 'direct-stream',
+          percent: 100,
+          playableUrl: currentTrack.url,
+          mode: 'direct-stream'
+        }));
+        musicRoomClient
+          .updateParticipantStatus(code, participantId, {
+            status: 'direct-stream',
+            readyTrackId: currentTrack.id,
+            downloadProgress: 100
+          })
+          .catch(() => {});
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [room?.code, participantId, currentTrack?.id, currentTrack?.url, currentTrack?.source]);
+
+  // Отдельный эффект для удержания нужных Blob URL и фоновой предзагрузки следующего трека
+  useEffect(() => {
+    setPinnedUrls([currentTrack?.url, nextTrack?.url].filter(Boolean));
+
+    const isCurrentReady =
+      currentTrack?.id &&
+      downloadState.trackId === currentTrack.id &&
+      (downloadState.stage === 'ready' || downloadState.stage === 'direct-stream');
+
+    if (
+      !isCurrentReady ||
+      !nextTrack?.url ||
+      nextTrack.source === 'soundcloud' ||
+      nextTrack.source === 'youtube'
+    ) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      prefetchTrack(nextTrack.url, nextTrack.sizeBytes || 0);
+    }, 450);
+
+    return () => clearTimeout(timer);
+  }, [
+    currentTrack?.id,
+    currentTrack?.url,
+    nextTrack?.id,
+    nextTrack?.url,
+    nextTrack?.sizeBytes,
+    nextTrack?.source,
+    downloadState.trackId,
+    downloadState.stage
+  ]);
+
+  // Барьерный триггер хоста: как только ВСЕ онлайн-участники загрузили трек (100%),
+  // ставим общую будущую миллисекунду старта (serverNow + 650мс)
+  useEffect(() => {
+    if (!isHost || !room?.code || !currentTrack) return;
+    if (playback.phase !== 'buffering') return;
+    if (!barrierState.allReady) return;
+    if (launchedBarrierNonceRef.current === playback.actionNonce) return;
+
+    launchedBarrierNonceRef.current = playback.actionNonce;
+    const leadMs = barrierState.onlineCount > 1 ? 650 : 120;
+
+    musicRoomClient
+      .updatePlayback(room.code, {
+        phase: 'playing',
+        isPlaying: true,
+        anchorPos: playback.anchorPos || 0,
+        anchorServerTime: getServerNow() + leadMs,
+        playbackRate: 1.0,
+        actionNonce: Date.now()
+      })
+      .catch(() => {});
+  }, [
+    isHost,
+    room?.code,
+    currentTrack?.id,
+    playback.phase,
+    playback.actionNonce,
+    playback.anchorPos,
+    barrierState.allReady,
+    barrierState.onlineCount
+  ]);
+
+  // Быстрый и плавный цикл синхронизации (200 мс) по единой математике computeDriftAction
+  useEffect(() => {
+    if (!currentTrack) {
+      setCountdownMs(0);
+      return;
+    }
 
     const interval = setInterval(() => {
       if (isSeekingRef.current) return;
 
       const serverNow = getServerNow();
-      let expectedPos = 0;
+      const leftMs = getStartCountdownMs(playback, serverNow);
+      setCountdownMs(leftMs);
 
-      if (playback.isPlaying) {
-        expectedPos = computeExpectedPosition(playback, serverNow, effectiveDuration);
-      } else {
-        expectedPos = playback.anchorPos || 0;
+      if (playback.phase === 'buffering' || leftMs > 0) {
+        setDisplayTime(playback.anchorPos || 0);
+        setDriftMs(0);
+        return;
       }
 
+      const expectedPos = computeExpectedPosition(playback, serverNow, effectiveDuration);
       setDisplayTime(expectedPos);
 
-      // Проверка локального времени в плеере
-      if (playerRef.current) {
-        try {
-          const now = Date.now();
+      if (!playerRef.current) return;
+      if (!playerRef.current.isTrackLoaded?.(currentTrack.id)) return;
 
-          // Если только что сменился трек — первые 2.5 секунды даем аудиобуферу спокойно заполниться
-          if (now < trackSwitchGraceUntilRef.current) {
+      try {
+        const currentLocal = playerRef.current.getCurrentTime();
+        if (typeof currentLocal !== 'number' || isNaN(currentLocal) || currentLocal < 0) return;
+
+        // Если плеер в момент старта не успел запуститься (кроме блокировки автоплея) — запускаем
+        if (playback.isPlaying && playerRef.current.isPaused?.() && !autoplayBlocked) {
+          playerRef.current.resumePlayback?.();
+          return;
+        }
+
+        const action = computeDriftAction({
+          expectedPos,
+          actualPos: currentLocal,
+          isPlaying: Boolean(playback.isPlaying),
+          duration: effectiveDuration
+        });
+
+        setDriftMs(action.driftMs);
+        const now = Date.now();
+
+        if (action.type === 'seek') {
+          if (now - lastSeekAtRef.current > 900) {
+            lastSeekAtRef.current = now;
+            playerRef.current.seekTo(action.targetPos, 'seconds');
             playerRef.current.setPlaybackRate?.(1.0);
-            return;
           }
-
-          const currentLocal = playerRef.current.getCurrentTime();
-          if (typeof currentLocal === 'number' && !isNaN(currentLocal) && currentLocal >= 0) {
-            // diffSec = expectedPos - currentLocal: если > 0, локальный плеер отстает
-            const diffSec = expectedPos - currentLocal;
-            const absDiff = Math.abs(diffSec);
-            const drift = Math.round(diffSec * 1000);
-            setDriftMs(drift);
-
-            if (!playback.isPlaying) {
-              if (absDiff > 0.1) {
-                playerRef.current.seekTo(expectedPos, 'seconds');
-              }
-              playerRef.current.setPlaybackRate?.(1.0);
-            } else {
-              // Если рассинхрон ощутимый (> 0.85 сек) и плеер уже реально играет (> 0.4с)
-              if (absDiff > 0.85 && currentLocal > 0.4 && (now - lastSeekAtRef.current > 1500)) {
-                lastSeekAtRef.current = now;
-                playerRef.current.seekTo(expectedPos, 'seconds');
-                playerRef.current.setPlaybackRate?.(1.0);
-              } else if (absDiff > 0.18) {
-                // Если рассинхрон 180..850 мс — адаптивное настигание (1.08x или 0.92x)
-                // Отставание 300 мс настигается за ~3.5 секунды абсолютно без заикания!
-                const rate = diffSec > 0 ? 1.08 : 0.92;
-                playerRef.current.setPlaybackRate?.(rate);
-              } else if (absDiff > 0.035) {
-                // Если рассинхрон 35..180 мс — тонкая микро-подгонка (1.03x или 0.97x)
-                const rate = diffSec > 0 ? 1.03 : 0.97;
-                playerRef.current.setPlaybackRate?.(rate);
-              } else {
-                // Идеальный синхрон (до 35 мс) — чистая скорость 1.0x
-                playerRef.current.setPlaybackRate?.(1.0);
-              }
-            }
-          }
-        } catch {}
-      }
-    }, 350);
+        } else if (action.type === 'rate') {
+          playerRef.current.setPlaybackRate?.(action.rate);
+        } else if (action.type === 'none') {
+          playerRef.current.setPlaybackRate?.(1.0);
+        }
+      } catch {}
+    }, 200);
 
     return () => clearInterval(interval);
-  }, [currentTrack?.id, playback, effectiveDuration]);
+  }, [currentTrack?.id, playback, effectiveDuration, autoplayBlocked]);
 
-  // Добавление пачки треков (например, всех 20 треков Stray Kids в 1 клик)
+  // Вспомогательная команда хоста: запуск трека (через барьер готовности или сразу)
+  const launchTrackAsHost = useCallback(
+    async (trackId, startPos = 0) => {
+      const r = roomRef.current;
+      if (!r?.code || !trackId) return;
+      const useBarrier = r.settings?.waitForListeners !== false;
+
+      if (useBarrier) {
+        await musicRoomClient.updatePlayback(r.code, {
+          trackId,
+          phase: 'buffering',
+          isPlaying: false,
+          anchorPos: startPos,
+          anchorServerTime: getServerNow(),
+          playbackRate: 1.0,
+          actionNonce: Date.now()
+        });
+      } else {
+        await musicRoomClient.updatePlayback(r.code, {
+          trackId,
+          phase: 'playing',
+          isPlaying: true,
+          anchorPos: startPos,
+          anchorServerTime: getServerNow() + 250,
+          playbackRate: 1.0,
+          actionNonce: Date.now()
+        });
+      }
+    },
+    []
+  );
+
+  // Добавление всех 20 треков в 1 клик
   const handleAddBatchTracks = useCallback(
     async (presets) => {
       if (!isHost || !room?.code) return;
@@ -171,20 +410,13 @@ export default function RoomScreen({
         await musicRoomClient.updateQueue(room.code, newQueue);
 
         if (!roomRef.current?.playback?.trackId || currentQueue.length === 0) {
-          await musicRoomClient.updatePlayback(room.code, {
-            trackId: newItems[0].id,
-            isPlaying: true,
-            anchorPos: 0,
-            anchorServerTime: getServerNow(),
-            playbackRate: 1.0,
-            actionNonce: Date.now()
-          });
+          await launchTrackAsHost(newItems[0].id, 0);
         }
       } finally {
         setIsAddingUrl(false);
       }
     },
-    [isHost, room?.code]
+    [isHost, room?.code, launchTrackAsHost]
   );
 
   // Добавление трека по ссылке
@@ -201,41 +433,49 @@ export default function RoomScreen({
         const newQueue = [...currentQueue, meta];
         await musicRoomClient.updateQueue(room.code, newQueue);
 
-        // Если сейчас ничего не играет — сразу запускаем добавленный трек
         if (!roomRef.current?.playback?.trackId || currentQueue.length === 0) {
-          await musicRoomClient.updatePlayback(room.code, {
-            trackId: meta.id,
-            isPlaying: true,
-            anchorPos: 0,
-            anchorServerTime: getServerNow(),
-            playbackRate: 1.0,
-            actionNonce: Date.now()
-          });
+          await launchTrackAsHost(meta.id, 0);
         }
       } finally {
         setIsAddingUrl(false);
       }
     },
-    [isHost, room?.code]
+    [isHost, room?.code, launchTrackAsHost]
   );
 
-  // Воспроизведение конкретного трека из списка
+  // Включение выбранного трека из очереди
   const handlePlayTrack = useCallback(
     async (trackId) => {
       if (!isHost || !room?.code) return;
       advancingNonceRef.current = Date.now();
-      isReadyRef.current = false;
-      await musicRoomClient.updatePlayback(room.code, {
-        trackId,
-        isPlaying: true,
-        anchorPos: 0,
-        anchorServerTime: getServerNow(),
-        playbackRate: 1.0,
-        actionNonce: Date.now()
-      });
+      await launchTrackAsHost(trackId, 0);
     },
-    [isHost, room?.code]
+    [isHost, room?.code, launchTrackAsHost]
   );
+
+  // Принудительный старт без ожидания отстающих устройств
+  const handleForceStartNow = useCallback(async () => {
+    if (!isHost || !room?.code || !playback.trackId) return;
+    launchedBarrierNonceRef.current = playback.actionNonce;
+    await musicRoomClient.updatePlayback(room.code, {
+      trackId: playback.trackId,
+      phase: 'playing',
+      isPlaying: true,
+      anchorPos: playback.anchorPos || 0,
+      anchorServerTime: getServerNow() + 450,
+      playbackRate: 1.0,
+      actionNonce: Date.now()
+    });
+  }, [isHost, room?.code, playback.trackId, playback.anchorPos, playback.actionNonce]);
+
+  // Переключение режима барьерной синхронизации
+  const handleToggleWaitForListeners = useCallback(async () => {
+    if (!isHost || !room?.code) return;
+    const current = roomRef.current?.settings?.waitForListeners !== false;
+    await musicRoomClient.updateSettings(room.code, {
+      waitForListeners: !current
+    });
+  }, [isHost, room?.code]);
 
   // Пауза / Возобновление
   const handlePlayOrPause = useCallback(async () => {
@@ -247,32 +487,54 @@ export default function RoomScreen({
     if (q.length === 0) return;
 
     const activeId = r.playback?.trackId || q[0].id;
-    const currentIsPlaying = Boolean(r.playback?.isPlaying);
-    const newIsPlaying = !currentIsPlaying;
+    const isCurrentlyActive = Boolean(
+      r.playback?.isPlaying || r.playback?.phase === 'buffering'
+    );
     const serverNow = getServerNow();
 
-    let newAnchorPos = 0;
-    if (playerRef.current) {
-      try {
-        const cur = playerRef.current.getCurrentTime();
-        if (typeof cur === 'number' && !isNaN(cur)) {
-          newAnchorPos = cur;
-        }
-      } catch {}
-    }
-    if (newAnchorPos === 0) {
-      newAnchorPos = displayTime;
+    if (isCurrentlyActive) {
+      let newAnchorPos = r.playback?.anchorPos || 0;
+      if (r.playback?.phase !== 'buffering' && playerRef.current) {
+        try {
+          const cur = playerRef.current.getCurrentTime();
+          if (typeof cur === 'number' && !isNaN(cur) && cur > 0) {
+            newAnchorPos = cur;
+          }
+        } catch {}
+      }
+
+      await musicRoomClient.updatePlayback(room.code, {
+        trackId: activeId,
+        phase: 'paused',
+        isPlaying: false,
+        anchorPos: newAnchorPos,
+        anchorServerTime: serverNow,
+        playbackRate: 1.0,
+        actionNonce: Date.now()
+      });
+      return;
     }
 
-    await musicRoomClient.updatePlayback(room.code, {
-      trackId: activeId,
-      isPlaying: newIsPlaying,
-      anchorPos: newAnchorPos,
-      anchorServerTime: serverNow,
-      playbackRate: 1.0,
-      actionNonce: Date.now()
-    });
-  }, [isHost, room?.code, displayTime]);
+    // Возобновление воспроизведения: если уже загружено у всех онлайн — стартуем синхронно!
+    const currentPos = r.playback?.anchorPos || displayTime || 0;
+    const readyCheck = evaluateBarrierReadiness(r.participants, activeId);
+    const useBarrier = r.settings?.waitForListeners !== false;
+
+    if (!useBarrier || readyCheck.allReady) {
+      const leadMs = readyCheck.onlineCount > 1 ? 450 : 80;
+      await musicRoomClient.updatePlayback(room.code, {
+        trackId: activeId,
+        phase: 'playing',
+        isPlaying: true,
+        anchorPos: currentPos,
+        anchorServerTime: serverNow + leadMs,
+        playbackRate: 1.0,
+        actionNonce: Date.now()
+      });
+    } else {
+      await launchTrackAsHost(activeId, currentPos);
+    }
+  }, [isHost, room?.code, displayTime, launchTrackAsHost]);
 
   // Перемотка (Seek)
   const handleSeekChange = useCallback((e) => {
@@ -291,16 +553,20 @@ export default function RoomScreen({
         playerRef.current.seekTo(targetPos, 'seconds');
       }
 
+      const isCurrentlyPlaying = Boolean(playback.isPlaying && playback.phase !== 'buffering');
+      const leadMs = isCurrentlyPlaying && barrierState.onlineCount > 1 ? 350 : 0;
+
       await musicRoomClient.updatePlayback(room.code, {
         trackId: currentTrack?.id || playback.trackId,
-        isPlaying: playback.isPlaying,
+        phase: isCurrentlyPlaying ? 'playing' : 'paused',
+        isPlaying: isCurrentlyPlaying,
         anchorPos: targetPos,
-        anchorServerTime: getServerNow(),
+        anchorServerTime: getServerNow() + leadMs,
         playbackRate: 1.0,
         actionNonce: Date.now()
       });
     },
-    [isHost, room?.code, currentTrack?.id, playback]
+    [isHost, room?.code, currentTrack?.id, playback, barrierState.onlineCount]
   );
 
   // Следующий трек
@@ -317,8 +583,8 @@ export default function RoomScreen({
         nextIdx = currentIdx;
       } else if (currentIdx >= 0) {
         if (currentIdx === q.length - 1 && settings.repeatMode === 'off' && isAuto) {
-          // Очередь закончилась, режим без повтора
           await musicRoomClient.updatePlayback(room.code, {
+            phase: 'paused',
             isPlaying: false,
             anchorPos: effectiveDuration,
             anchorServerTime: getServerNow(),
@@ -329,23 +595,10 @@ export default function RoomScreen({
         nextIdx = (currentIdx + 1) % q.length;
       }
 
-      const nextTrack = q[nextIdx];
-      isReadyRef.current = false;
-      lastSeekAtRef.current = Date.now();
-      if (playerRef.current) {
-        playerRef.current.seekTo(0, 'seconds');
-      }
-
-      await musicRoomClient.updatePlayback(room.code, {
-        trackId: nextTrack.id,
-        isPlaying: true,
-        anchorPos: 0,
-        anchorServerTime: getServerNow(),
-        playbackRate: 1.0,
-        actionNonce: Date.now()
-      });
+      const next = q[nextIdx];
+      await launchTrackAsHost(next.id, 0);
     },
-    [isHost, room?.code, settings.repeatMode, effectiveDuration]
+    [isHost, room?.code, settings.repeatMode, effectiveDuration, launchTrackAsHost]
   );
 
   // Предыдущий трек
@@ -355,29 +608,9 @@ export default function RoomScreen({
     if (q.length === 0) return;
 
     const currentIdx = q.findIndex((t) => t.id === roomRef.current?.playback?.trackId);
-    let prevIdx = 0;
-    if (currentIdx > 0) {
-      prevIdx = currentIdx - 1;
-    } else {
-      prevIdx = q.length - 1;
-    }
-
-    const prevTrack = q[prevIdx];
-    isReadyRef.current = false;
-    lastSeekAtRef.current = Date.now();
-    if (playerRef.current) {
-      playerRef.current.seekTo(0, 'seconds');
-    }
-
-    await musicRoomClient.updatePlayback(room.code, {
-      trackId: prevTrack.id,
-      isPlaying: true,
-      anchorPos: 0,
-      anchorServerTime: getServerNow(),
-      playbackRate: 1.0,
-      actionNonce: Date.now()
-    });
-  }, [isHost, room?.code]);
+    const prevIdx = currentIdx > 0 ? currentIdx - 1 : q.length - 1;
+    await launchTrackAsHost(q[prevIdx].id, 0);
+  }, [isHost, room?.code, launchTrackAsHost]);
 
   // Переключение режима повтора
   const handleCycleRepeat = useCallback(async () => {
@@ -395,20 +628,13 @@ export default function RoomScreen({
       const newQueue = q.filter((t) => t.id !== trackId);
       await musicRoomClient.updateQueue(room.code, newQueue);
 
-      // Если удалили играющий трек
       if (roomRef.current?.playback?.trackId === trackId) {
         if (newQueue.length > 0) {
-          isReadyRef.current = false;
-          await musicRoomClient.updatePlayback(room.code, {
-            trackId: newQueue[0].id,
-            isPlaying: playback.isPlaying,
-            anchorPos: 0,
-            anchorServerTime: getServerNow(),
-            actionNonce: Date.now()
-          });
+          await launchTrackAsHost(newQueue[0].id, 0);
         } else {
           await musicRoomClient.updatePlayback(room.code, {
             trackId: null,
+            phase: 'idle',
             isPlaying: false,
             anchorPos: 0,
             anchorServerTime: getServerNow(),
@@ -417,7 +643,7 @@ export default function RoomScreen({
         }
       }
     },
-    [isHost, room?.code, playback.isPlaying]
+    [isHost, room?.code, launchTrackAsHost]
   );
 
   // Перемещение трека в очереди
@@ -435,38 +661,48 @@ export default function RoomScreen({
     [isHost, room?.code]
   );
 
-  // Разблокировка автоплея для мобильных устройств
+  // Разблокировка автоплея
   const handleUnlockAutoplay = useCallback(() => {
     setAutoplayBlocked(false);
-    if (playerRef.current) {
+    if (playerRef.current && currentTrack?.id) {
       try {
         const expected = computeExpectedPosition(playback, getServerNow(), effectiveDuration);
         playerRef.current.seekTo(expected, 'seconds');
         lastSeekAtRef.current = Date.now();
+        playerRef.current.resumePlayback?.();
       } catch {}
     }
-  }, [playback, effectiveDuration]);
+  }, [playback, effectiveDuration, currentTrack?.id]);
 
   // Коллбеки плеера
   const handlePlayerDuration = useCallback((dur) => {
-    if (dur && dur > 0) {
+    if (dur && Number.isFinite(dur) && dur > 0) {
       setPlayerDuration(dur);
     }
   }, []);
 
   const handlePlayerEnded = useCallback(() => {
     const currentNonce = roomRef.current?.playback?.actionNonce;
-    if (isHost && advancingNonceRef.current !== currentNonce) {
+    if (
+      isHost &&
+      roomRef.current?.playback?.phase !== 'buffering' &&
+      advancingNonceRef.current !== currentNonce
+    ) {
       advancingNonceRef.current = currentNonce;
       handleNextTrack(true);
     }
   }, [isHost, handleNextTrack]);
 
   const handlePlayerReady = useCallback(() => {
-    isReadyRef.current = true;
-    if (playerRef.current && currentTrack) {
+    if (
+      playerRef.current &&
+      currentTrack &&
+      playback.isPlaying &&
+      playback.phase !== 'buffering' &&
+      getStartCountdownMs(playback, getServerNow()) === 0
+    ) {
       const exp = computeExpectedPosition(playback, getServerNow(), effectiveDuration);
-      if (exp > 0.5) {
+      if (exp > 0.25) {
         playerRef.current.seekTo(exp, 'seconds');
         lastSeekAtRef.current = Date.now();
       }
@@ -481,14 +717,18 @@ export default function RoomScreen({
   const handlePlayerBufferEnd = useCallback(() => {
     isBufferingRef.current = false;
     setIsBuffering(false);
+    setAutoplayBlocked(false);
   }, []);
 
-  const handlePlayerError = useCallback((err) => {
-    console.warn('ReactPlayer playback error:', err);
-    if (playback.isPlaying) {
-      setAutoplayBlocked(true);
-    }
-  }, [playback.isPlaying]);
+  const handlePlayerError = useCallback(
+    (err) => {
+      console.warn('Playback error / policy block:', err);
+      if (playback.isPlaying && playback.phase !== 'buffering') {
+        setAutoplayBlocked(true);
+      }
+    },
+    [playback.isPlaying, playback.phase]
+  );
 
   return (
     <div className="min-h-[100dvh] flex flex-col pb-10">
@@ -540,11 +780,16 @@ export default function RoomScreen({
           queueLength={queue.length}
           autoplayBlocked={autoplayBlocked}
           isBuffering={isBuffering}
+          downloadState={downloadState}
+          barrierState={barrierState}
+          countdownMs={countdownMs}
           onUnlockAutoplay={handleUnlockAutoplay}
           onPrevTrack={handlePrevTrack}
           onPlayOrPause={handlePlayOrPause}
           onNextTrack={handleNextTrack}
           onCycleRepeat={handleCycleRepeat}
+          onToggleWaitForListeners={handleToggleWaitForListeners}
+          onForceStartNow={handleForceStartNow}
           onSeekChange={handleSeekChange}
           onSeekCommit={handleSeekCommit}
           onToggleMute={() => setIsMuted((v) => !v)}
@@ -577,9 +822,8 @@ export default function RoomScreen({
           <LobbyPanel
             participants={participants}
             participantId={participantId}
-            isHost={isHost}
             currentTrack={currentTrack}
-            isPlaying={Boolean(playback.isPlaying)}
+            playback={playback}
           />
         </div>
       </main>

@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { computeExpectedPosition, computeDriftAction } from '../src/utils/syncEngine.js';
+import {
+  computeExpectedPosition,
+  computeDriftAction,
+  getStartCountdownMs,
+  evaluateBarrierReadiness
+} from '../src/utils/syncEngine.js';
 
 test('computeExpectedPosition returns 0 when no trackId', () => {
   assert.equal(computeExpectedPosition(null, 10000, 120), 0);
@@ -90,4 +95,54 @@ test('computeDriftAction signals ended near track end only while playing', () =>
     duration: 200
   });
   assert.equal(pausedEnd.type, 'none');
+});
+
+test('computeExpectedPosition and getStartCountdownMs honor scheduled future start and buffering phase', () => {
+  const scheduled = {
+    trackId: 't1',
+    phase: 'playing',
+    isPlaying: true,
+    anchorPos: 12,
+    anchorServerTime: 10650,
+    playbackRate: 1
+  };
+  assert.equal(computeExpectedPosition(scheduled, 10200, 180), 12);
+  assert.equal(getStartCountdownMs(scheduled, 10200), 450);
+  assert.equal(getStartCountdownMs(scheduled, 10650), 0);
+  assert.equal(computeExpectedPosition(scheduled, 11650, 180), 13);
+
+  const buffering = {
+    trackId: 't1',
+    phase: 'buffering',
+    isPlaying: true,
+    anchorPos: 5,
+    anchorServerTime: 9000
+  };
+  assert.equal(computeExpectedPosition(buffering, 15000, 180), 5);
+  assert.equal(getStartCountdownMs(buffering, 8500), 0);
+});
+
+test('evaluateBarrierReadiness tracks online participants waiting and readiness accurately', () => {
+  const hostReadyTabletDownloading = [
+    { id: 'u1', name: 'Хост', isOnline: true, status: 'ready', readyTrackId: 't1', downloadProgress: 100 },
+    { id: 'u2', name: 'Планшет', isOnline: true, status: 'downloading', readyTrackId: null, downloadProgress: 60 },
+    { id: 'u3', name: 'Ушёл', isOnline: false, status: 'offline', readyTrackId: null, downloadProgress: 0 }
+  ];
+
+  const partial = evaluateBarrierReadiness(hostReadyTabletDownloading, 't1');
+  assert.equal(partial.onlineCount, 2);
+  assert.equal(partial.readyCount, 1);
+  assert.equal(partial.allReady, false);
+  assert.equal(partial.avgProgress, 80);
+  assert.equal(partial.waitingParticipants.length, 1);
+  assert.equal(partial.waitingParticipants[0].name, 'Планшет');
+
+  const bothReady = [
+    { id: 'u1', name: 'Хост', isOnline: true, status: 'ready', readyTrackId: 't1', downloadProgress: 100 },
+    { id: 'u2', name: 'Планшет', isOnline: true, status: 'direct-stream', readyTrackId: 't1', downloadProgress: 100 }
+  ];
+  const full = evaluateBarrierReadiness(bothReady, 't1');
+  assert.equal(full.allReady, true);
+  assert.equal(full.readyCount, 2);
+  assert.equal(full.avgProgress, 100);
 });

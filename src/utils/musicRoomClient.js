@@ -60,7 +60,7 @@ export function normalizeRoomSnapshot(raw) {
     hostName: raw.hostName || 'Ведущий',
     settings: {
       repeatMode: 'all', // 'all' | 'one' | 'off'
-      waitForListeners: false,
+      waitForListeners: true,
       ...(raw.settings || {})
     },
     participants,
@@ -68,6 +68,7 @@ export function normalizeRoomSnapshot(raw) {
     queue,
     playback: {
       trackId: null,
+      phase: 'idle',
       isPlaying: false,
       anchorPos: 0,
       anchorServerTime: getServerNow(),
@@ -100,7 +101,7 @@ class MusicRoomClient {
       hostName: cleanName,
       settings: {
         repeatMode: 'all',
-        waitForListeners: false
+        waitForListeners: true
       },
       participants: {
         [participantId]: {
@@ -112,12 +113,14 @@ class MusicRoomClient {
           connInstanceId,
           joinedAt: now,
           status: 'ready',
-          transferProgress: 100
+          readyTrackId: null,
+          downloadProgress: 100
         }
       },
       queue: [],
       playback: {
         trackId: null,
+        phase: 'idle',
         isPlaying: false,
         anchorPos: 0,
         anchorServerTime: now,
@@ -157,8 +160,8 @@ class MusicRoomClient {
       connInstanceId,
       joinedAt: roomVal.participants?.[participantId]?.joinedAt || now,
       status: isHost ? 'ready' : 'connecting',
-      readyTrackId: isHost ? (roomVal.playback?.trackId || null) : null,
-      transferProgress: isHost ? 100 : 0
+      readyTrackId: null,
+      downloadProgress: 0
     };
 
     await set(ref(database, `music_rooms/${code}/participants/${participantId}`), participantData);
@@ -250,7 +253,8 @@ class MusicRoomClient {
       url: String(t.url || ''),
       source: String(t.source || 'audio'),
       thumbnail: t.thumbnail ? String(t.thumbnail) : null,
-      duration: Number(t.duration) || 0
+      duration: Number(t.duration) || 0,
+      sizeBytes: Number(t.sizeBytes) || 0
     }));
     await set(ref(database, `music_rooms/${roomCode}/queue`), cleanQueue);
   }
