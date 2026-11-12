@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   computeExpectedPosition,
   computeDriftAction,
+  evaluateSustainedSeek,
   getStartCountdownMs,
   evaluateBarrierReadiness,
   moveTrackAfterCurrent,
@@ -226,4 +227,60 @@ test('computeDriftAction honors Bluetooth/mobile deadband and hysteresis cleanly
     currentRate: 1.0
   });
   assert.equal(softBehind.type, 'rate');
+});
+
+test('BT safe mode locks playbackRate at 1.0 and requires sustained drift before seeking', () => {
+  // With disableRateAdjust=true, 600ms jitter must NOT warp playbackRate or seek (< 1.5s)
+  const btStable = computeDriftAction({
+    expectedPos: 30.6,
+    actualPos: 30.0,
+    isPlaying: true,
+    duration: 180,
+    deadbandSec: 0.25,
+    exitDeadbandSec: 0.12,
+    seekThresholdSec: 1.5,
+    rateDelta: 0.02,
+    currentRate: 1.0,
+    disableRateAdjust: true
+  });
+  assert.equal(btStable.type, 'none');
+  assert.equal(btStable.rate, 1.0);
+
+  // Beyond 1.5s returns seek, gated by sustained check counter (4 consecutive ticks)
+  const btFar = computeDriftAction({
+    expectedPos: 31.8,
+    actualPos: 30.0,
+    isPlaying: true,
+    duration: 180,
+    seekThresholdSec: 1.5,
+    disableRateAdjust: true
+  });
+  assert.equal(btFar.type, 'seek');
+
+  let count = 0;
+  for (let i = 0; i < 3; i++) {
+    const res = evaluateSustainedSeek({
+      actionType: 'seek',
+      consecutiveCount: count,
+      requiredChecks: 4
+    });
+    assert.equal(res.shouldSeek, false);
+    count = res.nextCount;
+  }
+  const triggered = evaluateSustainedSeek({
+    actionType: 'seek',
+    consecutiveCount: count,
+    requiredChecks: 4
+  });
+  assert.equal(triggered.shouldSeek, true);
+  assert.equal(triggered.nextCount, 0);
+
+  // Single non-seek tick resets sustained drift counter
+  const reset = evaluateSustainedSeek({
+    actionType: 'none',
+    consecutiveCount: 2,
+    requiredChecks: 4
+  });
+  assert.equal(reset.shouldSeek, false);
+  assert.equal(reset.nextCount, 0);
 });

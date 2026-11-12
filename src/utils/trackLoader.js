@@ -448,7 +448,7 @@ export function prefetchTrack(rawUrl, expectedSizeBytes = 0) {
  * остальные из окна lookahead — на диск в Cache Storage), не перегружая память при длинных плейлистах.
  * Возвращает функцию отмены при перестроении очереди.
  */
-export function startQueuePrefetchPipeline(tracks = [], maxLookahead = 6) {
+export function startQueuePrefetchPipeline(tracks = [], maxLookahead = 6, stepDelayMs = 350) {
   let cancelled = false;
 
   (async () => {
@@ -477,7 +477,7 @@ export function startQueuePrefetchPipeline(tracks = [], maxLookahead = 6) {
       }).catch(() => null);
 
       if (!cancelled && i + 1 < limit) {
-        await new Promise((r) => setTimeout(r, 350));
+        await new Promise((r) => setTimeout(r, Math.max(150, stepDelayMs)));
       }
     }
   })();

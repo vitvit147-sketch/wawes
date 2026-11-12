@@ -5,6 +5,7 @@ import { musicRoomClient } from '../utils/musicRoomClient';
 import {
   computeExpectedPosition,
   computeDriftAction,
+  evaluateSustainedSeek,
   getStartCountdownMs,
   evaluateBarrierReadiness,
   moveTrackAfterCurrent,
@@ -69,8 +70,10 @@ export default function RoomScreen({
   const lastResumeAttemptAtRef = useRef(0);
   const lastUiHalfSecRef = useRef(-1);
   const smoothedDriftRef = useRef(null);
+  const consecutiveSeekCountRef = useRef(0);
   const isBufferingRef = useRef(false);
   const lastCacheSyncRef = useRef({ nextReadyId: undefined, cachedCount: -1 });
+  const syncStateRef = useRef({});
 
   const isMobileDevice = useMemo(
     () =>
@@ -78,6 +81,26 @@ export default function RoomScreen({
       /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || ''),
     []
   );
+
+  const [bluetoothSafe, setBluetoothSafe] = useState(() => {
+    try {
+      const saved = localStorage.getItem('wavesync_bt_safe');
+      if (saved === '1') return true;
+      if (saved === '0') return false;
+    } catch {}
+    return typeof navigator !== 'undefined' &&
+      /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+  });
+
+  const handleToggleBluetoothSafe = useCallback(() => {
+    setBluetoothSafe((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('wavesync_bt_safe', next ? '1' : '0');
+      } catch {}
+      return next;
+    });
+  }, []);
 
   const queue = room?.queue || [];
   const playback = room?.playback || {};
@@ -296,9 +319,10 @@ export default function RoomScreen({
 
     let stopPipeline = () => {};
     const lookahead = isMobileDevice ? 2 : 4;
-    const startDelayMs = isMobileDevice ? 2000 : 600;
+    const startDelayMs = isMobileDevice ? 4000 : 600;
+    const stepDelayMs = isMobileDevice ? 850 : 350;
     const timer = setTimeout(() => {
-      stopPipeline = startQueuePrefetchPipeline(orderedTracks, lookahead);
+      stopPipeline = startQueuePrefetchPipeline(orderedTracks, lookahead, stepDelayMs);
     }, startDelayMs);
 
     return () => {
@@ -381,45 +405,70 @@ export default function RoomScreen({
     barrierState.onlineCount
   ]);
 
+  // Актуальный срез состояния для стабильного интервала синхронизации (не перезапускается от RTDB-обновлений участников)
+  syncStateRef.current = {
+    currentTrack,
+    playback,
+    effectiveDuration,
+    autoplayBlocked,
+    bluetoothSafe,
+    isMobileDevice
+  };
+
   // Сброс окна сглаживания при смене трека / старте / паузе (защита Bluetooth HAL на Android)
   useEffect(() => {
     lastTransitionAtRef.current = Date.now();
     smoothedDriftRef.current = null;
+    consecutiveSeekCountRef.current = 0;
     lastUiHalfSecRef.current = -1;
-  }, [currentTrack?.id, playback?.actionNonce, playback?.isPlaying, playback?.phase]);
+  }, [currentTrack?.id, playback?.actionNonce, playback?.isPlaying, playback?.phase, bluetoothSafe]);
 
-  // Плавный цикл синхронизации со сглаживанием джиттера (без дёргания Bluetooth/WSOLA)
+  // Стабильный цикл синхронизации: в BT-защите playbackRate не трогается, а seek только при устойчивом сдвиге > 1.5с
+  const hasCurrentTrack = Boolean(currentTrack?.id);
   useEffect(() => {
-    if (!currentTrack) {
+    if (!hasCurrentTrack) {
       setCountdownMs(0);
       return;
     }
 
-    const syncIntervalMs = isMobileDevice ? 300 : 250;
-    const deadbandSec = isMobileDevice ? 0.14 : 0.08;
-    const exitDeadbandSec = isMobileDevice ? 0.055 : 0.035;
-    const seekThresholdSec = isMobileDevice ? 0.65 : 0.45;
-    const rateDelta = isMobileDevice ? 0.018 : 0.025;
-    const seekCooldownMs = isMobileDevice ? 3200 : 2000;
-    const rateCooldownMs = isMobileDevice ? 1400 : 900;
-    const graceMs = isMobileDevice ? 1800 : 900;
+    const syncIntervalMs = isMobileDevice || bluetoothSafe ? 350 : 250;
 
     const interval = setInterval(() => {
       if (isSeekingRef.current) return;
 
+      const {
+        currentTrack: track,
+        playback: pb,
+        effectiveDuration: dur,
+        autoplayBlocked: blocked,
+        bluetoothSafe: btSafe
+      } = syncStateRef.current;
+
+      if (!track || !pb) return;
+
+      const deadbandSec = btSafe ? 0.25 : 0.10;
+      const exitDeadbandSec = btSafe ? 0.12 : 0.04;
+      const seekThresholdSec = btSafe ? 1.5 : 0.65;
+      const rateDelta = 0.02;
+      const seekCooldownMs = btSafe ? 8000 : 2800;
+      const rateCooldownMs = 1100;
+      const graceMs = btSafe ? 3500 : 1200;
+      const requiredSeekChecks = btSafe ? 4 : 2;
+
       const serverNow = getServerNow();
-      const leftMs = getStartCountdownMs(playback, serverNow);
+      const leftMs = getStartCountdownMs(pb, serverNow);
       setCountdownMs((prev) => (prev === leftMs ? prev : leftMs));
 
-      if (playback.phase === 'buffering' || leftMs > 0) {
-        const anchor = playback.anchorPos || 0;
+      if (pb.phase === 'buffering' || leftMs > 0) {
+        const anchor = pb.anchorPos || 0;
         lastUiHalfSecRef.current = Math.floor(anchor * 2);
         setDisplayTime((prev) => (Math.abs(prev - anchor) < 0.05 ? prev : anchor));
         setDriftMs((prev) => (prev === 0 ? prev : 0));
+        consecutiveSeekCountRef.current = 0;
         return;
       }
 
-      const expectedPos = computeExpectedPosition(playback, serverNow, effectiveDuration);
+      const expectedPos = computeExpectedPosition(pb, serverNow, dur);
       const halfSec = Math.floor(expectedPos * 2);
       if (halfSec !== lastUiHalfSecRef.current) {
         lastUiHalfSecRef.current = halfSec;
@@ -427,29 +476,32 @@ export default function RoomScreen({
       }
 
       const player = playerRef.current;
-      if (!player || !player.isTrackLoaded?.(currentTrack.id)) return;
-      if (player.isSeeking?.()) return;
+      if (!player || !player.isTrackLoaded?.(track.id)) return;
+      if (player.isSeeking?.() || player.isPlayPending?.()) return;
 
       const now = Date.now();
+      const inGraceWindow =
+        now - lastTransitionAtRef.current < graceMs || now - lastSeekAtRef.current < graceMs;
+
       try {
         const currentLocal = player.getCurrentTime();
         if (typeof currentLocal !== 'number' || isNaN(currentLocal) || currentLocal < 0) return;
 
-        // Если плеер в момент старта не успел запуститься (кроме блокировки автоплея) — запускаем с защитным таймаутом
-        if (playback.isPlaying && player.isPaused?.() && !autoplayBlocked) {
-          if (now - lastResumeAttemptAtRef.current > 1200) {
+        // Если плеер в момент старта не успел запуститься (после завершения окна запуска) — пробуем мягко возобновить
+        if (pb.isPlaying && player.isPaused?.() && !blocked) {
+          if (!inGraceWindow && now - lastResumeAttemptAtRef.current > 1500) {
             lastResumeAttemptAtRef.current = now;
             player.resumePlayback?.();
           }
           return;
         }
 
-        // Окно прогрева после старта/перемотки: даём Android MediaCodec и Bluetooth A2DP открыть поток без дёргания
-        if (
-          playback.isPlaying &&
-          (now - lastTransitionAtRef.current < graceMs || now - lastSeekAtRef.current < graceMs)
-        ) {
-          player.setPlaybackRate?.(1.0);
+        // Окно прогрева после старта/перемотки: даём MediaCodec и Bluetooth A2DP стабилизироваться
+        if (pb.isPlaying && inGraceWindow) {
+          if (Math.abs((player.getPlaybackRate?.() || 1.0) - 1.0) > 0.002) {
+            player.setPlaybackRate?.(1.0);
+          }
+          consecutiveSeekCountRef.current = 0;
           return;
         }
 
@@ -457,7 +509,7 @@ export default function RoomScreen({
         const smoothedDrift =
           smoothedDriftRef.current === null
             ? rawDrift
-            : smoothedDriftRef.current * 0.6 + rawDrift * 0.4;
+            : smoothedDriftRef.current * 0.65 + rawDrift * 0.35;
         smoothedDriftRef.current = smoothedDrift;
 
         const smoothedActualPos = Math.max(0, expectedPos - smoothedDrift);
@@ -466,31 +518,50 @@ export default function RoomScreen({
         const action = computeDriftAction({
           expectedPos,
           actualPos: smoothedActualPos,
-          isPlaying: Boolean(playback.isPlaying),
-          duration: effectiveDuration,
+          isPlaying: Boolean(pb.isPlaying),
+          duration: dur,
           deadbandSec,
           exitDeadbandSec,
           seekThresholdSec,
           rateDelta,
-          currentRate
+          currentRate,
+          disableRateAdjust: btSafe
         });
 
-        setDriftMs((prev) => (Math.abs(prev - action.driftMs) >= 25 ? action.driftMs : prev));
+        setDriftMs((prev) => (Math.abs(prev - action.driftMs) >= 50 ? action.driftMs : prev));
 
-        if (action.type === 'seek') {
+        const sustained = evaluateSustainedSeek({
+          actionType: action.type,
+          consecutiveCount: consecutiveSeekCountRef.current,
+          requiredChecks: requiredSeekChecks
+        });
+        consecutiveSeekCountRef.current = sustained.nextCount;
+
+        if (sustained.shouldSeek) {
           if (now - lastSeekAtRef.current > seekCooldownMs) {
             lastSeekAtRef.current = now;
+            lastTransitionAtRef.current = now;
             smoothedDriftRef.current = 0;
-            player.seekTo(action.targetPos, 'seconds');
+            const compensatedTarget =
+              pb.isPlaying && dur > 0
+                ? Math.min(Math.max(0, dur - 0.1), action.targetPos + 0.08)
+                : action.targetPos;
+            player.seekTo(compensatedTarget, 'seconds');
             player.setPlaybackRate?.(1.0);
           }
-        } else if (action.type === 'rate') {
-          if (Math.abs(currentRate - action.rate) > 0.002 && now - lastRateChangeAtRef.current > rateCooldownMs) {
+        } else if (!btSafe && action.type === 'rate') {
+          if (
+            Math.abs(currentRate - action.rate) > 0.002 &&
+            now - lastRateChangeAtRef.current > rateCooldownMs
+          ) {
             lastRateChangeAtRef.current = now;
             player.setPlaybackRate?.(action.rate);
           }
         } else if (action.type === 'none') {
-          if (Math.abs(currentRate - 1.0) > 0.002 && now - lastRateChangeAtRef.current > rateCooldownMs) {
+          if (
+            Math.abs(currentRate - 1.0) > 0.002 &&
+            (btSafe || now - lastRateChangeAtRef.current > rateCooldownMs)
+          ) {
             lastRateChangeAtRef.current = now;
             player.setPlaybackRate?.(1.0);
           }
@@ -499,7 +570,7 @@ export default function RoomScreen({
     }, syncIntervalMs);
 
     return () => clearInterval(interval);
-  }, [currentTrack?.id, playback, effectiveDuration, autoplayBlocked, isMobileDevice]);
+  }, [hasCurrentTrack, bluetoothSafe, isMobileDevice]);
 
   // Вспомогательная команда хоста: запуск трека (через барьер готовности или сразу)
   const launchTrackAsHost = useCallback(
@@ -974,20 +1045,31 @@ export default function RoomScreen({
   }, [isHost, handleNextTrack]);
 
   const handlePlayerReady = useCallback(() => {
+    const {
+      currentTrack: track,
+      playback: pb,
+      effectiveDuration: dur,
+      bluetoothSafe: btSafe
+    } = syncStateRef.current;
+
     if (
       playerRef.current &&
-      currentTrack &&
-      playback.isPlaying &&
-      playback.phase !== 'buffering' &&
-      getStartCountdownMs(playback, getServerNow()) === 0
+      track &&
+      pb?.isPlaying &&
+      pb?.phase !== 'buffering' &&
+      getStartCountdownMs(pb, getServerNow()) === 0
     ) {
-      const exp = computeExpectedPosition(playback, getServerNow(), effectiveDuration);
-      if (exp > 0.25) {
+      const exp = computeExpectedPosition(pb, getServerNow(), dur);
+      const cur = Number(playerRef.current.getCurrentTime?.()) || 0;
+      const minJoinGapSec = btSafe ? 1.35 : 0.75;
+      const now = Date.now();
+      if (Math.abs(exp - cur) > minJoinGapSec && now - lastSeekAtRef.current > 2000) {
         playerRef.current.seekTo(exp, 'seconds');
-        lastSeekAtRef.current = Date.now();
+        lastSeekAtRef.current = now;
+        lastTransitionAtRef.current = now;
       }
     }
-  }, [currentTrack, playback, effectiveDuration]);
+  }, []);
 
   const handlePlayerBuffer = useCallback(() => {
     isBufferingRef.current = true;
@@ -1064,6 +1146,8 @@ export default function RoomScreen({
           barrierState={barrierState}
           countdownMs={countdownMs}
           nextTrackPrefetchInfo={nextTrackPrefetchInfo}
+          bluetoothSafe={bluetoothSafe}
+          onToggleBluetoothSafe={handleToggleBluetoothSafe}
           onUnlockAutoplay={handleUnlockAutoplay}
           onPrevTrack={handlePrevTrack}
           onPlayOrPause={handlePlayOrPause}

@@ -21,7 +21,8 @@ import {
   CheckCircle2,
   Clock,
   Zap,
-  ShieldCheck
+  ShieldCheck,
+  Bluetooth
 } from 'lucide-react';
 
 function YouTubeIcon({ className = 'w-3 h-3 text-red-400' }) {
@@ -52,6 +53,8 @@ export default function PlayerCard({
   barrierState,
   countdownMs,
   nextTrackPrefetchInfo,
+  bluetoothSafe,
+  onToggleBluetoothSafe,
   onUnlockAutoplay,
   onPrevTrack,
   onPlayOrPause,
@@ -87,8 +90,12 @@ export default function PlayerCard({
   const soundcloudPlayerRef = useRef(null);
   const loadedTrackIdRef = useRef(null);
   const launchTimerRef = useRef(null);
+  const fallbackLaunchTimerRef = useRef(null);
   const rafLaunchRef = useRef(null);
   const pendingSeekRef = useRef(null);
+  const isPlayPendingRef = useRef(false);
+  const readyNotifiedKeyRef = useRef('');
+  const lastStartedKeyRef = useRef('');
 
   const [audioPausedState, setAudioPausedState] = useState(true);
 
@@ -96,6 +103,10 @@ export default function PlayerCard({
     if (launchTimerRef.current) {
       clearTimeout(launchTimerRef.current);
       launchTimerRef.current = null;
+    }
+    if (fallbackLaunchTimerRef.current) {
+      clearTimeout(fallbackLaunchTimerRef.current);
+      fallbackLaunchTimerRef.current = null;
     }
     if (rafLaunchRef.current) {
       cancelAnimationFrame(rafLaunchRef.current);
@@ -150,6 +161,7 @@ export default function PlayerCard({
           if (isSoundCloud) return !playback?.isPlaying;
           return audioElRef.current ? audioElRef.current.paused : true;
         },
+        isPlayPending: () => isPlayPendingRef.current,
         isTrackLoaded: (trackId) => {
           if (isSoundCloud) return Boolean(currentTrack?.id === trackId);
           return Boolean(
@@ -159,13 +171,111 @@ export default function PlayerCard({
           );
         },
         resumePlayback: () => {
-          if (!isSoundCloud && audioElRef.current && playableAudioSrc) {
-            audioElRef.current.play().catch((err) => onPlayerError?.(err));
+          if (!isSoundCloud && audioElRef.current && playableAudioSrc && !isPlayPendingRef.current) {
+            isPlayPendingRef.current = true;
+            const p = audioElRef.current.play();
+            if (p && p.finally) {
+              p.catch((err) => onPlayerError?.(err)).finally(() => {
+                isPlayPendingRef.current = false;
+              });
+            } else {
+              isPlayPendingRef.current = false;
+            }
           }
         }
       };
     }
   });
+
+  // Интеграция с MediaSession API: удерживает фоновое воспроизведение и Bluetooth A2DP
+  // при выключенном экране телефона (в кармане / тренажёрном зале).
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const ms = navigator.mediaSession;
+
+    if (!currentTrack) {
+      ms.playbackState = 'none';
+      return;
+    }
+
+    if (typeof MediaMetadata !== 'undefined') {
+      try {
+        ms.metadata = new MediaMetadata({
+          title: currentTrack.title || 'WaveSync',
+          artist: currentTrack.artist || 'Stray Kids',
+          album: currentTrack.album || 'WaveSync',
+          artwork: currentTrack.thumbnail
+            ? [{ src: currentTrack.thumbnail, sizes: '512x512', type: 'image/jpeg' }]
+            : []
+        });
+      } catch {}
+    }
+
+    ms.playbackState =
+      playback?.isPlaying && playback?.phase !== 'buffering' ? 'playing' : 'paused';
+
+    const setHandler = (action, handler) => {
+      try {
+        ms.setActionHandler(action, handler);
+      } catch {}
+    };
+
+    if (isHost) {
+      setHandler('play', () => {
+        if (!playback?.isPlaying) onPlayOrPause?.();
+      });
+      setHandler('pause', () => {
+        if (playback?.isPlaying) onPlayOrPause?.();
+      });
+      setHandler('nexttrack', () => onNextTrack?.(false));
+      setHandler('previoustrack', () => onPrevTrack?.());
+    } else {
+      // На телефоне слушателя сохраняем активную медиа-сессию без случайного стопа при касании наушников
+      setHandler('play', () => {
+        if (audioElRef.current && playableAudioSrc && playback?.isPlaying) {
+          audioElRef.current.play().catch(() => {});
+        }
+      });
+      setHandler('pause', () => {
+        if (audioElRef.current && !playback?.isPlaying) {
+          audioElRef.current.pause();
+        }
+      });
+      setHandler('nexttrack', null);
+      setHandler('previoustrack', null);
+    }
+  }, [
+    currentTrack?.id,
+    currentTrack?.title,
+    currentTrack?.artist,
+    currentTrack?.album,
+    currentTrack?.thumbnail,
+    playback?.isPlaying,
+    playback?.phase,
+    isHost,
+    playableAudioSrc,
+    onPlayOrPause,
+    onNextTrack,
+    onPrevTrack
+  ]);
+
+  useEffect(() => {
+    if (
+      typeof navigator === 'undefined' ||
+      !('mediaSession' in navigator) ||
+      typeof navigator.mediaSession.setPositionState !== 'function'
+    ) {
+      return;
+    }
+    if (!currentTrack || !effectiveDuration || !Number.isFinite(effectiveDuration)) return;
+    try {
+      navigator.mediaSession.setPositionState({
+        duration: effectiveDuration,
+        playbackRate: 1.0,
+        position: Math.min(Math.max(0, Number(displayTime) || 0), effectiveDuration)
+      });
+    } catch {}
+  }, [currentTrack?.id, effectiveDuration, displayTime]);
 
   // Отдельный эффект только для громкости — не сбрасывает воспроизведение и seek!
   useEffect(() => {
@@ -181,6 +291,8 @@ export default function PlayerCard({
 
     if (isSoundCloud || !playableAudioSrc) {
       loadedTrackIdRef.current = null;
+      readyNotifiedKeyRef.current = '';
+      lastStartedKeyRef.current = '';
       pendingSeekRef.current = null;
       if (audio.getAttribute('src')) {
         audio.pause();
@@ -192,6 +304,8 @@ export default function PlayerCard({
 
     if (audio.src !== playableAudioSrc) {
       loadedTrackIdRef.current = null;
+      readyNotifiedKeyRef.current = '';
+      lastStartedKeyRef.current = '';
       audio.pause();
       audio.playbackRate = 1.0;
       audio.src = playableAudioSrc;
@@ -207,6 +321,7 @@ export default function PlayerCard({
     if (!audio || isSoundCloud) return;
 
     if (!playableAudioSrc || !currentTrack?.id) {
+      lastStartedKeyRef.current = '';
       audio.pause();
       audio.playbackRate = 1.0;
       return;
@@ -214,11 +329,13 @@ export default function PlayerCard({
 
     const isBarrierBuffering = playback?.phase === 'buffering';
     if (isBarrierBuffering || !playback?.isPlaying) {
+      lastStartedKeyRef.current = '';
+      isPlayPendingRef.current = false;
       audio.pause();
       audio.playbackRate = 1.0;
       const targetPos = Number(playback?.anchorPos) || 0;
       if (audio.readyState >= 1) {
-        if (Math.abs(audio.currentTime - targetPos) > 0.05) {
+        if (Math.abs(audio.currentTime - targetPos) > 0.08) {
           try {
             audio.currentTime = targetPos;
           } catch {}
@@ -229,8 +346,19 @@ export default function PlayerCard({
       return;
     }
 
+    const startKey = `${playableAudioSrc}::${currentTrack.id}::${playback?.actionNonce}::${playback?.anchorServerTime}`;
+    if (lastStartedKeyRef.current === startKey && (!audio.paused || isPlayPendingRef.current)) {
+      return;
+    }
+
+    let launched = false;
     // Точный запуск воспроизведения (по расписанию или сразу в текущую точку)
     const startPlaybackSynced = () => {
+      if (launched) return;
+      launched = true;
+      clearScheduledLaunch();
+      lastStartedKeyRef.current = startKey;
+
       const serverNow = getServerNow();
       const expected = computeExpectedPosition(playback, serverNow, effectiveDuration);
       if (Math.abs(audio.playbackRate - 1.0) > 0.002) {
@@ -238,7 +366,7 @@ export default function PlayerCard({
       }
 
       if (audio.readyState >= 1) {
-        if (Math.abs(audio.currentTime - expected) > 0.08) {
+        if (Math.abs(audio.currentTime - expected) > 0.18) {
           try {
             audio.currentTime = expected;
           } catch {}
@@ -247,12 +375,19 @@ export default function PlayerCard({
         pendingSeekRef.current = expected;
       }
 
+      isPlayPendingRef.current = true;
       const playPromise = audio.play();
       if (playPromise && playPromise.catch) {
-        playPromise.catch((err) => {
-          console.warn('Audio play prevented by browser policy:', err);
-          onPlayerError?.(err);
-        });
+        playPromise
+          .catch((err) => {
+            console.warn('Audio play prevented by browser policy:', err);
+            onPlayerError?.(err);
+          })
+          .finally(() => {
+            isPlayPendingRef.current = false;
+          });
+      } else {
+        isPlayPendingRef.current = false;
       }
     };
 
@@ -261,7 +396,7 @@ export default function PlayerCard({
       // Готовим позицию заранее и ждём точной миллисекунды синхро-старта
       const prePos = Number(playback?.anchorPos) || 0;
       audio.pause();
-      if (audio.readyState >= 1 && Math.abs(audio.currentTime - prePos) > 0.05) {
+      if (audio.readyState >= 1 && Math.abs(audio.currentTime - prePos) > 0.08) {
         try {
           audio.currentTime = prePos;
         } catch {}
@@ -269,8 +404,17 @@ export default function PlayerCard({
         pendingSeekRef.current = prePos;
       }
 
-      const wakeDelay = Math.max(0, delayMs - 20);
+      // Надёжный setTimeout-страховщик: гарантирует старт даже с выключенным экраном (в кармане),
+      // когда браузер замораживает requestAnimationFrame
+      fallbackLaunchTimerRef.current = setTimeout(startPlaybackSynced, delayMs);
+
+      const wakeDelay = Math.max(0, delayMs - 24);
       launchTimerRef.current = setTimeout(() => {
+        if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+          const leftNow = getStartCountdownMs(playback, getServerNow());
+          if (leftNow <= 8) startPlaybackSynced();
+          return;
+        }
         const waitFrame = () => {
           const left = getStartCountdownMs(playback, getServerNow());
           if (left <= 6) {
@@ -311,12 +455,12 @@ export default function PlayerCard({
 
   return (
     <section className="rounded-3xl bg-gradient-to-br from-slate-900/95 via-slate-900/90 to-indigo-950/60 border border-white/12 p-5 sm:p-6 shadow-2xl relative overflow-hidden">
-      {/* Постоянно смонтированный <audio> элемент — гарантирует стабильный автоплей на планшетах и мобильных */}
+      {/* Постоянно смонтированный <audio> элемент — sr-only вместо display:none для стабильной работы в фоне */}
       <audio
         ref={audioElRef}
         preload="auto"
         playsInline
-        className="hidden"
+        className="sr-only"
         onLoadedMetadata={(e) => {
           loadedTrackIdRef.current = currentTrack?.id || null;
           onPlayerDuration?.(e.target.duration);
@@ -335,7 +479,11 @@ export default function PlayerCard({
             } catch {}
             pendingSeekRef.current = null;
           }
-          onPlayerReady?.();
+          const readyKey = `${playableAudioSrc}::${currentTrack?.id || ''}`;
+          if (readyNotifiedKeyRef.current !== readyKey) {
+            readyNotifiedKeyRef.current = readyKey;
+            onPlayerReady?.();
+          }
         }}
         onWaiting={() => onPlayerBuffer?.()}
         onPlaying={() => {
@@ -423,13 +571,27 @@ export default function PlayerCard({
               </span>
             </button>
           )}
+
+          <button
+            type="button"
+            onClick={onToggleBluetoothSafe}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold border transition-all cursor-pointer ${
+              bluetoothSafe
+                ? 'bg-emerald-500/15 text-emerald-300 border-emerald-400/35 hover:bg-emerald-500/25'
+                : 'bg-slate-800/80 text-slate-400 border-white/10 hover:text-slate-200'
+            }`}
+          >
+            <Bluetooth className="w-3.5 h-3.5" />
+            <span>{bluetoothSafe ? 'BT-защита: ВКЛ' : 'Точный режим'}</span>
+          </button>
         </div>
 
         <div className="flex items-center gap-2 text-xs flex-wrap">
           <span
             className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-semibold ${
               firebaseStatus.connected
-                ? Math.abs(driftMs) <= 140 && playback?.isPlaying
+                ? (bluetoothSafe ? Math.abs(driftMs) <= 1500 : Math.abs(driftMs) <= 140) &&
+                  playback?.isPlaying
                   ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
                   : 'bg-sky-500/10 text-sky-300 border border-sky-500/25'
                 : 'bg-amber-500/10 text-amber-300 border border-amber-500/25'
@@ -447,6 +609,10 @@ export default function PlayerCard({
                 ? 'Буферизация...'
                 : !playback?.isPlaying
                 ? 'На паузе'
+                : bluetoothSafe
+                ? Math.abs(driftMs) <= 1500
+                  ? 'Стабильно · BT'
+                  : 'Подстройка...'
                 : Math.abs(driftMs) <= 140
                 ? 'Синхронизировано'
                 : 'Подстройка...'

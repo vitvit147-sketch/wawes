@@ -106,7 +106,8 @@ export function computeDriftAction({
   exitDeadbandSec = 0.035,
   seekThresholdSec = 0.35,
   rateDelta = 0.03,
-  currentRate = 1.0
+  currentRate = 1.0,
+  disableRateAdjust = false
 }) {
   const safeExpected = Math.max(0, Number(expectedPos) || 0);
   const safeActual = Math.max(0, Number(actualPos) || 0);
@@ -134,6 +135,12 @@ export function computeDriftAction({
     };
   }
 
+  // В режиме защиты Bluetooth / мобильного звука никогда не меняем playbackRate,
+  // чтобы не ломать аппаратный аудиопоток и A2DP-буфер наушников.
+  if (disableRateAdjust) {
+    return { type: 'none', rate: 1.0, driftMs };
+  }
+
   const isAlreadyAdjusting = Math.abs((Number(currentRate) || 1) - 1) > 0.002;
   const triggerLimit = isAlreadyAdjusting ? Math.min(deadbandSec, exitDeadbandSec) : deadbandSec;
 
@@ -147,6 +154,26 @@ export function computeDriftAction({
   }
 
   return { type: 'none', rate: 1.0, driftMs };
+}
+
+/**
+ * Счётчик устойчивого рассинхрона: защищает от ложных seek-перемоток при единичных
+ * скачках таймера в фоне или кратковременных задержках Bluetooth A2DP.
+ */
+export function evaluateSustainedSeek({
+  actionType,
+  consecutiveCount = 0,
+  requiredChecks = 3
+}) {
+  if (actionType !== 'seek') {
+    return { shouldSeek: false, nextCount: 0 };
+  }
+  const nextCount = Math.max(0, Number(consecutiveCount) || 0) + 1;
+  const threshold = Math.max(1, Number(requiredChecks) || 1);
+  if (nextCount >= threshold) {
+    return { shouldSeek: true, nextCount: 0 };
+  }
+  return { shouldSeek: false, nextCount };
 }
 
 /**

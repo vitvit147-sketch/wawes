@@ -67,8 +67,12 @@ try {
  * Серия из 5 быстрых NTP-замеров через RTDB REST API с выбором образца с минимальным RTT.
  * Убирает рассинхрон часов до ±15–25 мс между разными устройствами (ноутбук/планшет/телефон).
  */
-export async function calibrateServerClock(clientKey = '') {
+export async function calibrateServerClock(clientKey = '', options = {}) {
+  const { force = false } = options || {};
   if (typeof fetch !== 'function' || typeof performance === 'undefined') return null;
+  if (clockCalibrated && !force && clockRttMs !== null && clockRttMs <= 260) {
+    return { offsetMs: serverTimeOffsetMs, rttMs: clockRttMs };
+  }
   if (calibrationPromise) return calibrationPromise;
 
   calibrationPromise = (async () => {
@@ -79,7 +83,7 @@ export async function calibrateServerClock(clientKey = '') {
     const pingUrl = `${firebaseConfig.databaseURL}/music_rooms/_ping/${encodeURIComponent(id)}.json`;
 
     const samples = [];
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6; i++) {
       try {
         const wallBefore = Date.now();
         const perfBefore = performance.now();
@@ -111,10 +115,13 @@ export async function calibrateServerClock(clientKey = '') {
       // Пропускаем первый запрос (в нем сидит TCP/TLS handshake), если есть более свежие замеры
       const warmSamples = samples.length > 1 ? samples.slice(1) : samples;
       warmSamples.sort((a, b) => a.rtt - b.rtt);
-      const best = warmSamples[0];
+      const bestCount = warmSamples.length >= 2 ? 2 : 1;
+      const top = warmSamples.slice(0, bestCount);
+      const avgOffset = top.reduce((sum, s) => sum + s.offset, 0) / bestCount;
+      const avgRtt = top.reduce((sum, s) => sum + s.rtt, 0) / bestCount;
 
-      serverTimeOffsetMs = Math.round(best.offset);
-      clockRttMs = Math.round(best.rtt);
+      serverTimeOffsetMs = Math.round(avgOffset);
+      clockRttMs = Math.round(avgRtt);
       clockCalibrated = true;
       notifyStatus();
       return { offsetMs: serverTimeOffsetMs, rttMs: clockRttMs };
@@ -127,11 +134,12 @@ export async function calibrateServerClock(clientKey = '') {
   return calibrationPromise;
 }
 
-// Периодическая рекалибровка при возврате вкладки из сна/фона
+// Рекалибровка при возврате вкладки только если предыдущий замер был плохим или не выполнен
 if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   let lastCalibratedAt = 0;
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && Date.now() - lastCalibratedAt > 30000) {
+    const needsBetterClock = !clockCalibrated || (clockRttMs !== null && clockRttMs > 260);
+    if (document.visibilityState === 'visible' && needsBetterClock && Date.now() - lastCalibratedAt > 30000) {
       lastCalibratedAt = Date.now();
       calibrateServerClock().catch(() => {});
     }
