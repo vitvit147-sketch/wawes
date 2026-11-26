@@ -27,6 +27,7 @@ import {
   sendTrackViaRtdb,
   cleanupRtdbTransfer
 } from '../utils/rtdbAudioTransfer';
+import { IS_RU_SERVER_ENABLED, uploadFileToRuServer } from '../utils/ruServerClient';
 import PlayerCard from './PlayerCard';
 import QueuePanel from './QueuePanel';
 import LobbyPanel from './LobbyPanel';
@@ -789,16 +790,18 @@ export default function RoomScreen({
     }
   }, [isHost, room?.code]);
 
-  // Загрузка локальных аудиофайлов с телефона / ПК и передача в комнату
+  // Загрузка локальных аудиофайлов с телефона / ПК и передача в комнату (через RU HTTP-сервер или Firebase RTDB)
   const handleUploadLocalFiles = useCallback(
     async (fileList) => {
       const files = Array.from(fileList || []).filter((f) => f && f.size > 0);
-      if (!isHost || !room?.code || files.length === 0) return;
+      const canModify = isHost || Boolean(roomRef.current?.settings?.allowGuestQueue);
+      if (!canModify || !room?.code || files.length === 0) return;
 
-      const MAX_BYTES = 25 * 1024 * 1024;
+      const maxMb = IS_RU_SERVER_ENABLED ? 50 : 25;
+      const MAX_BYTES = maxMb * 1024 * 1024;
       const validFiles = files.filter((f) => f.size <= MAX_BYTES);
       if (validFiles.length === 0) {
-        throw new Error('Файл больше 25 МБ. Выберите MP3/M4A до 25 МБ на трек.');
+        throw new Error(`Файл больше ${maxMb} МБ. Выберите MP3/M4A до ${maxMb} МБ на трек.`);
       }
 
       setIsAddingUrl(true);
@@ -821,27 +824,41 @@ export default function RoomScreen({
           }
 
           const trackId = 'loc_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
-          const rtdbUrl = buildRtdbTrackUrl(room.code, trackId);
+          let trackUrl;
 
-          await registerLocalAudioFile(rtdbUrl, file, meta.mimeType);
-          await sendTrackViaRtdb({
-            roomCode: room.code,
-            trackId,
-            file,
-            mimeType: meta.mimeType,
-            onProgress: (pct) => {
+          if (IS_RU_SERVER_ENABLED) {
+            const uploaded = await uploadFileToRuServer(file, meta.mimeType, (pct) => {
               setUploadState({
                 fileName: file.name,
                 percent: pct,
                 index: i + 1,
                 total: validFiles.length
               });
-            }
-          });
+            });
+            trackUrl = uploaded.url;
+            await registerLocalAudioFile(trackUrl, file, meta.mimeType);
+          } else {
+            trackUrl = buildRtdbTrackUrl(room.code, trackId);
+            await registerLocalAudioFile(trackUrl, file, meta.mimeType);
+            await sendTrackViaRtdb({
+              roomCode: room.code,
+              trackId,
+              file,
+              mimeType: meta.mimeType,
+              onProgress: (pct) => {
+                setUploadState({
+                  fileName: file.name,
+                  percent: pct,
+                  index: i + 1,
+                  total: validFiles.length
+                });
+              }
+            });
+          }
 
           uploadedTracks.push({
             id: trackId,
-            url: rtdbUrl,
+            url: trackUrl,
             title: meta.title || file.name.replace(/\.[^.]+$/, ''),
             artist: meta.artist || 'С телефона',
             album: 'С устройства',
@@ -854,10 +871,9 @@ export default function RoomScreen({
 
         if (uploadedTracks.length > 0) {
           const currentQueue = roomRef.current?.queue || [];
-          const newQueue = [...currentQueue, ...uploadedTracks];
-          await musicRoomClient.updateQueue(room.code, newQueue);
+          await musicRoomClient.appendTracksToQueue(room.code, uploadedTracks, currentQueue);
 
-          if (!roomRef.current?.playback?.trackId || currentQueue.length === 0) {
+          if (isHost && (!roomRef.current?.playback?.trackId || currentQueue.length === 0)) {
             await launchTrackAsHost(uploadedTracks[0].id, 0);
           }
         }
@@ -872,17 +888,18 @@ export default function RoomScreen({
   // Добавление трека или целой папки (Яндекс Диск / прямая ссылка / пресет)
   const handleAddTrackByUrl = useCallback(
     async (url, presetMeta = null) => {
-      if (!isHost || !room?.code) return;
+      const canModify = isHost || Boolean(roomRef.current?.settings?.allowGuestQueue);
+      if (!canModify || !room?.code) return;
       setIsAddingUrl(true);
       try {
         const currentQueue = roomRef.current?.queue || [];
-        // Если нажали на уже добавленный пресет — переставляем его «Следующим» для мгновенного прелоада у всех!
+        // Если хост нажал на уже добавленный пресет — переставляем его «Следующим» для мгновенного прелоада у всех!
         if (presetMeta) {
           const existing = currentQueue.find(
             (t) => t.url === presetMeta.url || t.id === presetMeta.id
           );
           if (existing) {
-            if (existing.id !== roomRef.current?.playback?.trackId) {
+            if (isHost && existing.id !== roomRef.current?.playback?.trackId) {
               const nextQueue = moveTrackAfterCurrent(
                 currentQueue,
                 roomRef.current?.playback?.trackId,
@@ -918,10 +935,9 @@ export default function RoomScreen({
         }
 
         if (itemsToAdd.length > 0) {
-          const newQueue = [...currentQueue, ...itemsToAdd];
-          await musicRoomClient.updateQueue(room.code, newQueue);
+          await musicRoomClient.appendTracksToQueue(room.code, itemsToAdd, currentQueue);
 
-          if (!roomRef.current?.playback?.trackId || currentQueue.length === 0) {
+          if (isHost && (!roomRef.current?.playback?.trackId || currentQueue.length === 0)) {
             await launchTrackAsHost(itemsToAdd[0].id, 0);
           }
         }
@@ -975,6 +991,15 @@ export default function RoomScreen({
     const current = roomRef.current?.settings?.waitForListeners !== false;
     await musicRoomClient.updateSettings(room.code, {
       waitForListeners: !current
+    });
+  }, [isHost, room?.code]);
+
+  // Разрешить или запретить слушателям добавлять свои треки в очередь
+  const handleToggleAllowGuestQueue = useCallback(async () => {
+    if (!isHost || !room?.code) return;
+    const current = Boolean(roomRef.current?.settings?.allowGuestQueue);
+    await musicRoomClient.updateSettings(room.code, {
+      allowGuestQueue: !current
     });
   }, [isHost, room?.code]);
 
@@ -1324,6 +1349,7 @@ export default function RoomScreen({
           onNextTrack={handleNextTrack}
           onCycleRepeat={handleCycleRepeat}
           onToggleWaitForListeners={handleToggleWaitForListeners}
+          onToggleAllowGuestQueue={handleToggleAllowGuestQueue}
           onForceStartNow={handleForceStartNow}
           onSeekChange={handleSeekChange}
           onSeekCommit={handleSeekCommit}
@@ -1341,6 +1367,7 @@ export default function RoomScreen({
           <QueuePanel
             queue={queue}
             isHost={isHost}
+            canAddToQueue={isHost || Boolean(settings?.allowGuestQueue)}
             currentTrack={currentTrack}
             nextTrackId={nextTrack?.id}
             playback={playback}

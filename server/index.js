@@ -8,6 +8,7 @@ const PORT = Number(process.env.PORT) || 3080;
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || './uploads');
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 МБ на файл
 const FILE_TTL_MS = 12 * 60 * 60 * 1000; // Автоочистка временных файлов через 12 часов
+const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000; // Сохраняем комнату 10 мин после выхода всех (на случай реконнекта)
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -24,7 +25,7 @@ function corsHeaders(res) {
 }
 
 function generateRoomCode() {
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 12; i++) {
     const code = String(Math.floor(1000 + Math.random() * 9000));
     if (!rooms.has(code)) return code;
   }
@@ -40,7 +41,7 @@ function serializeRoom(room) {
     settings: room.settings,
     queue: room.queue,
     playback: room.playback,
-    participants: Object.values(room.participantsMap)
+    participants: room.participantsMap
   };
 }
 
@@ -51,6 +52,26 @@ function broadcastRoom(room) {
       ws.send(msg);
     }
   }
+}
+
+function sendAck(ws, reqId, payload) {
+  if (ws.readyState === 1 && reqId) {
+    ws.send(JSON.stringify({ type: 'ack', reqId, ...payload }));
+  }
+}
+
+function sanitizeQueueItem(t, idx = 0) {
+  return {
+    id: String(t.id || `t_${idx}_${Date.now().toString(36)}`),
+    title: String(t.title || 'Трек'),
+    artist: String(t.artist || 'Исполнитель'),
+    album: t.album ? String(t.album) : null,
+    url: String(t.url || ''),
+    source: String(t.source || 'audio'),
+    thumbnail: t.thumbnail ? String(t.thumbnail) : null,
+    duration: Number(t.duration) || 0,
+    sizeBytes: Number(t.sizeBytes) || 0
+  };
 }
 
 const server = http.createServer((req, res) => {
@@ -199,12 +220,14 @@ wss.on('connection', (ws) => {
       const code = generateRoomCode();
       const pid = String(msg.participantId || crypto.randomBytes(6).toString('hex'));
       const now = Date.now();
+      const cleanName = String(msg.name || 'Диджей').trim().slice(0, 24) || 'Диджей';
       const room = {
         code,
         createdAt: now,
+        emptySince: null,
         hostId: pid,
-        hostName: String(msg.name || 'Диджей').slice(0, 24),
-        settings: { repeatMode: 'all', waitForListeners: true },
+        hostName: cleanName,
+        settings: { repeatMode: 'all', waitForListeners: true, allowGuestQueue: false },
         queue: [],
         playback: {
           trackId: null,
@@ -218,10 +241,12 @@ wss.on('connection', (ws) => {
         participantsMap: {
           [pid]: {
             id: pid,
-            name: String(msg.name || 'Диджей').slice(0, 24),
+            name: cleanName,
             avatar: msg.avatar || '🎧',
             isHost: true,
             isOnline: true,
+            connInstanceId: msg.connInstanceId || '',
+            joinedAt: now,
             status: 'ready',
             readyTrackId: null,
             downloadProgress: 100
@@ -232,7 +257,7 @@ wss.on('connection', (ws) => {
       rooms.set(code, room);
       ws.roomCode = code;
       ws.participantId = pid;
-      ws.send(JSON.stringify({ type: 'joined', participantId: pid, room: serializeRoom(room) }));
+      sendAck(ws, msg.reqId, { ok: true, roomCode: code, participantId: pid, room: serializeRoom(room) });
       return;
     }
 
@@ -240,17 +265,22 @@ wss.on('connection', (ws) => {
       const code = String(msg.roomCode || '').trim();
       const room = rooms.get(code);
       if (!room) {
-        ws.send(JSON.stringify({ type: 'error', message: `Комната №${code} не найдена` }));
+        sendAck(ws, msg.reqId, { ok: false, error: `Комната №${code} не найдена или уже закрыта` });
         return;
       }
       const pid = String(msg.participantId || crypto.randomBytes(6).toString('hex'));
       const isHost = room.hostId === pid;
+      const cleanName =
+        String(msg.name || '').trim().slice(0, 24) || (isHost ? 'Диджей' : 'Слушатель');
+      room.emptySince = null;
       room.participantsMap[pid] = {
         id: pid,
-        name: String(msg.name || (isHost ? 'Диджей' : 'Слушатель')).slice(0, 24),
+        name: cleanName,
         avatar: msg.avatar || '🎧',
         isHost,
         isOnline: true,
+        connInstanceId: msg.connInstanceId || '',
+        joinedAt: room.participantsMap[pid]?.joinedAt || Date.now(),
         status: isHost ? 'ready' : 'connecting',
         readyTrackId: null,
         downloadProgress: 0
@@ -258,29 +288,114 @@ wss.on('connection', (ws) => {
       room.clients.add(ws);
       ws.roomCode = code;
       ws.participantId = pid;
-      ws.send(JSON.stringify({ type: 'joined', participantId: pid, room: serializeRoom(room) }));
+      sendAck(ws, msg.reqId, {
+        ok: true,
+        roomCode: code,
+        participantId: pid,
+        isHost,
+        room: serializeRoom(room)
+      });
       broadcastRoom(room);
       return;
     }
 
-    const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
-    if (!room) return;
+    if (msg.type === 'reconnect_room') {
+      const code = String(msg.roomCode || '').trim();
+      const pid = String(msg.participantId || '');
+      const room = rooms.get(code);
+      const existing = room?.participantsMap?.[pid];
+      if (!room || !existing) {
+        sendAck(ws, msg.reqId, { ok: false });
+        return;
+      }
+      room.emptySince = null;
+      room.participantsMap[pid] = {
+        ...existing,
+        isOnline: true,
+        connInstanceId: msg.connInstanceId || existing.connInstanceId || '',
+        status: existing.isHost ? 'ready' : 'connecting'
+      };
+      room.clients.add(ws);
+      ws.roomCode = code;
+      ws.participantId = pid;
+      sendAck(ws, msg.reqId, {
+        ok: true,
+        roomCode: code,
+        participantId: pid,
+        isHost: room.hostId === pid,
+        room: serializeRoom(room)
+      });
+      broadcastRoom(room);
+      return;
+    }
+
+    if (msg.type === 'leave_room') {
+      const code = String(msg.roomCode || ws.roomCode || '').trim();
+      const pid = String(msg.participantId || ws.participantId || '');
+      const room = rooms.get(code);
+      if (room) {
+        room.clients.delete(ws);
+        if (msg.isHost && pid === room.hostId) {
+          const deletedMsg = JSON.stringify({ type: 'room_deleted', roomCode: code });
+          for (const client of room.clients) {
+            if (client.readyState === 1) client.send(deletedMsg);
+          }
+          rooms.delete(code);
+        } else if (pid && room.participantsMap[pid]) {
+          delete room.participantsMap[pid];
+          if (room.clients.size === 0) room.emptySince = Date.now();
+          broadcastRoom(room);
+        }
+      }
+      ws.roomCode = null;
+      sendAck(ws, msg.reqId, { ok: true });
+      return;
+    }
+
+    const roomCode = String(msg.roomCode || ws.roomCode || '').trim();
+    const room = roomCode ? rooms.get(roomCode) : null;
+    if (!room) {
+      sendAck(ws, msg.reqId, { ok: false, error: 'Комната не найдена' });
+      return;
+    }
 
     if (msg.type === 'update_queue' && ws.participantId === room.hostId && Array.isArray(msg.queue)) {
-      room.queue = msg.queue;
+      room.queue = msg.queue.map((t, idx) => sanitizeQueueItem(t, idx));
       broadcastRoom(room);
+      sendAck(ws, msg.reqId, { ok: true });
+    } else if (
+      msg.type === 'append_queue' &&
+      Array.isArray(msg.tracks) &&
+      (ws.participantId === room.hostId || room.settings?.allowGuestQueue)
+    ) {
+      const existingUrls = new Set(room.queue.map((t) => t.url));
+      const added = [];
+      for (let i = 0; i < msg.tracks.length; i++) {
+        const clean = sanitizeQueueItem(msg.tracks[i], room.queue.length + i);
+        if (!clean.url || existingUrls.has(clean.url)) continue;
+        existingUrls.add(clean.url);
+        added.push(clean);
+      }
+      if (added.length > 0) {
+        room.queue = [...room.queue, ...added];
+        broadcastRoom(room);
+      }
+      sendAck(ws, msg.reqId, { ok: true, addedCount: added.length });
     } else if (msg.type === 'update_playback' && ws.participantId === room.hostId && msg.playback) {
       room.playback = { ...room.playback, ...msg.playback };
       broadcastRoom(room);
+      sendAck(ws, msg.reqId, { ok: true });
     } else if (msg.type === 'update_settings' && ws.participantId === room.hostId && msg.settings) {
       room.settings = { ...room.settings, ...msg.settings };
       broadcastRoom(room);
+      sendAck(ws, msg.reqId, { ok: true });
     } else if (msg.type === 'update_participant' && ws.participantId && msg.patch) {
       const existing = room.participantsMap[ws.participantId];
       if (existing) {
         room.participantsMap[ws.participantId] = { ...existing, ...msg.patch };
         broadcastRoom(room);
       }
+      sendAck(ws, msg.reqId, { ok: true });
     }
   });
 
@@ -293,23 +408,29 @@ wss.on('connection', (ws) => {
       room.participantsMap[ws.participantId].status = 'offline';
     }
     if (room.clients.size === 0) {
-      rooms.delete(room.code);
+      room.emptySince = Date.now();
     } else {
       broadcastRoom(room);
     }
   });
 });
 
-// Автоочистка временных аудиофайлов старше 12 часов
+// Автоочистка временных аудиофайлов (12 ч) и пустых комнат (10 мин)
 setInterval(() => {
-  const cutoff = Date.now() - FILE_TTL_MS;
+  const fileCutoff = Date.now() - FILE_TTL_MS;
   for (const [id, meta] of uploadedFiles.entries()) {
-    if (meta.createdAt < cutoff) {
+    if (meta.createdAt < fileCutoff) {
       uploadedFiles.delete(id);
       fs.unlink(meta.filePath, () => {});
     }
   }
-}, 30 * 60 * 1000).unref();
+  const roomCutoff = Date.now() - EMPTY_ROOM_TTL_MS;
+  for (const [code, room] of rooms.entries()) {
+    if (room.emptySince && room.emptySince < roomCutoff) {
+      rooms.delete(code);
+    }
+  }
+}, 5 * 60 * 1000).unref();
 
 server.listen(PORT, () => {
   console.log(`WaveSync RU server listening on http://0.0.0.0:${PORT}`);

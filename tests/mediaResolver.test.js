@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveTracksFromInput, detectMediaType } from '../src/utils/mediaUrlResolver.js';
+import { toRuWsUrl } from '../src/utils/ruServerClient.js';
 
 test('detectMediaType classifies Yandex Disk, SoundCloud, YouTube and direct audio URLs', () => {
   assert.equal(detectMediaType('https://disk.yandex.ru/d/AbCdEf123'), 'yandex');
@@ -52,4 +53,10 @@ test('resolveTracksFromInput expands Yandex Disk folder into multiple audio trac
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('toRuWsUrl converts http/https RU server URLs into WebSocket /ws endpoints', () => {
+  assert.equal(toRuWsUrl('https://api.wavesync.ru'), 'wss://api.wavesync.ru/ws');
+  assert.equal(toRuWsUrl('http://127.0.0.1:3080/'), 'ws://127.0.0.1:3080/ws');
+  assert.equal(toRuWsUrl(''), '');
 });

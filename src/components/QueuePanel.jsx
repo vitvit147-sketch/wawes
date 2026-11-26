@@ -58,6 +58,7 @@ function getAlbumStyle(album) {
 const QueuePanel = React.memo(function QueuePanel({
   queue = [],
   isHost,
+  canAddToQueue = false,
   currentTrack,
   nextTrackId,
   playback,
@@ -99,7 +100,8 @@ const QueuePanel = React.memo(function QueuePanel({
     }
   };
 
-  const activeView = isHost ? viewMode : 'queue';
+  const canAdd = isHost || Boolean(canAddToQueue);
+  const activeView = canAdd ? viewMode : 'queue';
   const queueUrlSet = useMemo(() => new Set(queue.map((t) => t.url)), [queue]);
 
   const cachedCount = queue.reduce((acc, t) => {
@@ -182,7 +184,7 @@ const QueuePanel = React.memo(function QueuePanel({
     <section className="lg:col-span-3 rounded-3xl bg-slate-900/85 border border-white/10 p-4 sm:p-5 shadow-xl flex flex-col">
       {/* Верхний переключатель как в Spotify / Яндекс Музыке */}
       <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
-        {isHost ? (
+        {canAdd ? (
           <div className="inline-flex p-1 rounded-2xl bg-slate-950/90 border border-white/10">
             <button
               type="button"
@@ -219,7 +221,7 @@ const QueuePanel = React.memo(function QueuePanel({
         )}
 
         <div className="flex items-center gap-2 text-xs">
-          {isHost && onUploadLocalFiles && (
+          {canAdd && onUploadLocalFiles && (
             <>
               <input
                 ref={fileInputRef}
@@ -286,7 +288,7 @@ const QueuePanel = React.memo(function QueuePanel({
       )}
 
       {/* ==================== РЕЖИМ 1: МЕДИАТЕКА (Spotify / Yandex style) ==================== */}
-      {isHost && activeView === 'library' && (
+      {canAdd && activeView === 'library' && (
         <div className="flex flex-col">
           {/* Поиск по всей медиатеке */}
           <div className="relative mb-3">
@@ -429,18 +431,20 @@ const QueuePanel = React.memo(function QueuePanel({
                         </span>
                       )}
 
-                      <button
-                        type="button"
-                        disabled={isAddingUrl}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onAddBatchTracks?.(alb.tracks, true);
-                        }}
-                        className="absolute bottom-2 right-2 w-9 h-9 rounded-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 flex items-center justify-center shadow-lg shadow-black/40 transition-all active:scale-95 cursor-pointer"
-                        aria-label={`Слушать ${alb.name}`}
-                      >
-                        <Play className="w-4 h-4 fill-current ml-0.5" />
-                      </button>
+                      {isHost && (
+                        <button
+                          type="button"
+                          disabled={isAddingUrl}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onAddBatchTracks?.(alb.tracks, true);
+                          }}
+                          className="absolute bottom-2 right-2 w-9 h-9 rounded-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 flex items-center justify-center shadow-lg shadow-black/40 transition-all active:scale-95 cursor-pointer"
+                          aria-label={`Слушать ${alb.name}`}
+                        >
+                          <Play className="w-4 h-4 fill-current ml-0.5" />
+                        </button>
+                      )}
                     </div>
 
                     <div className="text-xs sm:text-sm font-bold text-white truncate">
@@ -489,26 +493,28 @@ const QueuePanel = React.memo(function QueuePanel({
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      disabled={isAddingUrl}
-                      onClick={() => onAddBatchTracks?.(filteredPresets, true)}
-                      className="px-3.5 py-2 rounded-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-xs flex items-center gap-1.5 shadow-md cursor-pointer transition-all active:scale-95"
-                    >
-                      <Play className="w-3.5 h-3.5 fill-current" />
-                      <span>Слушать</span>
-                    </button>
-                    <button
-                      type="button"
-                      disabled={isAddingUrl}
-                      onClick={() => onAddBatchTracks?.(filteredPresets, false)}
-                      className="px-3 py-2 rounded-full bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs flex items-center gap-1 border border-white/10 cursor-pointer transition-all"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>В очередь</span>
-                    </button>
-                  </div>
+                  {isHost && (
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        disabled={isAddingUrl}
+                        onClick={() => onAddBatchTracks?.(filteredPresets, true)}
+                        className="px-3.5 py-2 rounded-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-xs flex items-center gap-1.5 shadow-md cursor-pointer transition-all active:scale-95"
+                      >
+                        <Play className="w-3.5 h-3.5 fill-current" />
+                        <span>Слушать</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isAddingUrl}
+                        onClick={() => onAddBatchTracks?.(filteredPresets, false)}
+                        className="px-3 py-2 rounded-full bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs flex items-center gap-1 border border-white/10 cursor-pointer transition-all"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>В очередь</span>
+                      </button>
+                    </div>
+                  )}
                 </div>
               ) : (
                 filteredPresets.length > 0 && (
@@ -518,26 +524,28 @@ const QueuePanel = React.memo(function QueuePanel({
                         ? `Найдено: ${filteredPresets.length}`
                         : `Треков: ${filteredPresets.length}`}
                     </span>
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        disabled={isAddingUrl}
-                        onClick={() => onAddBatchTracks?.(filteredPresets, true)}
-                        className="px-3 py-1.5 rounded-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-xs flex items-center gap-1 cursor-pointer transition-all active:scale-95"
-                      >
-                        <Play className="w-3 h-3 fill-current" />
-                        <span>Играть все</span>
-                      </button>
-                      <button
-                        type="button"
-                        disabled={isAddingUrl}
-                        onClick={() => onAddBatchTracks?.(filteredPresets, false)}
-                        className="px-2.5 py-1.5 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold text-xs flex items-center gap-1 cursor-pointer transition-all"
-                      >
-                        <Plus className="w-3 h-3" />
-                        <span>В очередь ({filteredPresets.length})</span>
-                      </button>
-                    </div>
+                    {isHost && (
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={isAddingUrl}
+                          onClick={() => onAddBatchTracks?.(filteredPresets, true)}
+                          className="px-3 py-1.5 rounded-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-xs flex items-center gap-1 cursor-pointer transition-all active:scale-95"
+                        >
+                          <Play className="w-3 h-3 fill-current" />
+                          <span>Играть все</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isAddingUrl}
+                          onClick={() => onAddBatchTracks?.(filteredPresets, false)}
+                          className="px-2.5 py-1.5 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold text-xs flex items-center gap-1 cursor-pointer transition-all"
+                        >
+                          <Plus className="w-3 h-3" />
+                          <span>В очередь ({filteredPresets.length})</span>
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )
               )}
@@ -559,7 +567,14 @@ const QueuePanel = React.memo(function QueuePanel({
                       return (
                         <div
                           key={preset.id}
-                          onClick={() => !isAddingUrl && onPlayPresetNow?.(preset)}
+                          onClick={() => {
+                            if (isAddingUrl) return;
+                            if (isHost) {
+                              onPlayPresetNow?.(preset);
+                            } else if (!isQueued) {
+                              onAddTrackByUrl?.(preset.url, preset);
+                            }
+                          }}
                           className={`group rounded-2xl px-2.5 py-2 flex items-center justify-between gap-3 transition-all cursor-pointer ${
                             isPlayingThis
                               ? 'bg-emerald-500/15 border border-emerald-400/30'
@@ -629,7 +644,7 @@ const QueuePanel = React.memo(function QueuePanel({
                               </span>
                             )}
 
-                            {!isPlayingThis && (
+                            {isHost && !isPlayingThis && (
                               <button
                                 type="button"
                                 disabled={isAddingUrl}
@@ -687,7 +702,7 @@ const QueuePanel = React.memo(function QueuePanel({
       {/* ==================== РЕЖИМ 2: ОЧЕРЕДЬ И ПРЯМЫЕ ССЫЛКИ ==================== */}
       {activeView === 'queue' && (
         <div className="flex flex-col">
-          {isHost && (
+          {canAdd && (
             <div className="mb-3.5">
               <form onSubmit={handleSubmit} className="flex gap-2">
                 <input

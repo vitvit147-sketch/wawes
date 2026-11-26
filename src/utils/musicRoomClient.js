@@ -1,6 +1,8 @@
-// Управление комнатами, очередью, участниками и состоянием воспроизведения через Firebase RTDB
+// Управление комнатами, очередью, участниками и состоянием воспроизведения
+// (прозрачно работает через Firebase RTDB или через собственный RU WebSocket-сервер при VITE_RU_SERVER_URL)
 import { database, getServerNow } from './firebase';
 import { ref, set, get, update, onValue, remove, onDisconnect } from 'firebase/database';
+import { IS_RU_SERVER_ENABLED, ruServerClient } from './ruServerClient';
 
 const AVATARS = ['🎧', '🎵', '💿', '🎙️', '🦊', '🚀', '⚡', '🌙', '🔥', '🎹', '🎷', '👾'];
 
@@ -37,6 +39,20 @@ function generateRoomCode() {
   return Math.floor(1000 + Math.random() * 9000).toString();
 }
 
+function sanitizeQueueItem(t, idx = 0) {
+  return {
+    id: String(t.id || 't_' + idx + '_' + Date.now().toString(36)),
+    title: String(t.title || 'Трек'),
+    artist: String(t.artist || 'Исполнитель'),
+    album: t.album ? String(t.album) : null,
+    url: String(t.url || ''),
+    source: String(t.source || 'audio'),
+    thumbnail: t.thumbnail ? String(t.thumbnail) : null,
+    duration: Number(t.duration) || 0,
+    sizeBytes: Number(t.sizeBytes) || 0
+  };
+}
+
 export function normalizeRoomSnapshot(raw) {
   if (!raw) return null;
 
@@ -61,6 +77,7 @@ export function normalizeRoomSnapshot(raw) {
     settings: {
       repeatMode: 'all', // 'all' | 'one' | 'off'
       waitForListeners: true,
+      allowGuestQueue: false,
       ...(raw.settings || {})
     },
     participants,
@@ -79,21 +96,75 @@ export function normalizeRoomSnapshot(raw) {
   };
 }
 
+function createStabilizedEmitter(onUpdate) {
+  let prevQueueSig = '';
+  let prevQueueRef = null;
+  let prevPlaybackSig = '';
+  let prevPlaybackRef = null;
+  let prevSettingsSig = '';
+  let prevSettingsRef = null;
+
+  return (raw) => {
+    const next = normalizeRoomSnapshot(raw);
+    if (!next) return;
+
+    // Стабилизируем ссылки неизменённых частей комнаты для сохранения эффективности React.memo
+    const qSig = JSON.stringify(next.queue);
+    if (prevQueueRef && qSig === prevQueueSig) {
+      next.queue = prevQueueRef;
+    } else {
+      prevQueueSig = qSig;
+      prevQueueRef = next.queue;
+    }
+
+    const pSig = JSON.stringify(next.playback);
+    if (prevPlaybackRef && pSig === prevPlaybackSig) {
+      next.playback = prevPlaybackRef;
+    } else {
+      prevPlaybackSig = pSig;
+      prevPlaybackRef = next.playback;
+    }
+
+    const sSig = JSON.stringify(next.settings);
+    if (prevSettingsRef && sSig === prevSettingsSig) {
+      next.settings = prevSettingsRef;
+    } else {
+      prevSettingsSig = sSig;
+      prevSettingsRef = next.settings;
+    }
+
+    onUpdate(next);
+  };
+}
+
 class MusicRoomClient {
   async createRoom({ name, avatar, connInstanceId }) {
     const participantId = getOrCreateParticipantId();
-    let code = generateRoomCode();
+    const cleanName = (name || '').trim() || 'Диджей';
+    const cleanAvatar = avatar || getRandomAvatar();
 
+    if (IS_RU_SERVER_ENABLED) {
+      const res = await ruServerClient.createRoom({
+        participantId,
+        name: cleanName,
+        avatar: cleanAvatar,
+        connInstanceId
+      });
+      return {
+        roomCode: res.roomCode,
+        participantId,
+        initialRoom: normalizeRoomSnapshot(res.room)
+      };
+    }
+
+    let code = generateRoomCode();
     for (let i = 0; i < 6; i++) {
       const existing = await get(ref(database, `music_rooms/${code}/code`));
       if (!existing.exists()) break;
       code = generateRoomCode();
     }
 
-    const cleanName = (name || '').trim() || 'Диджей';
-    const cleanAvatar = avatar || getRandomAvatar();
     const now = getServerNow();
-
     const initialRoom = {
       code,
       createdAt: now,
@@ -101,7 +172,8 @@ class MusicRoomClient {
       hostName: cleanName,
       settings: {
         repeatMode: 'all',
-        waitForListeners: true
+        waitForListeners: true,
+        allowGuestQueue: false
       },
       participants: {
         [participantId]: {
@@ -138,16 +210,31 @@ class MusicRoomClient {
   async joinRoom({ roomCode, name, avatar, connInstanceId }) {
     const code = String(roomCode || '').trim();
     if (!code) throw new Error('Введите 4-значный код комнаты');
+    const participantId = getOrCreateParticipantId();
+
+    if (IS_RU_SERVER_ENABLED) {
+      const res = await ruServerClient.joinRoom({
+        roomCode: code,
+        participantId,
+        name: (name || '').trim() || 'Слушатель',
+        avatar: avatar || getRandomAvatar(),
+        connInstanceId
+      });
+      return {
+        roomCode: res.roomCode,
+        participantId,
+        isHost: Boolean(res.isHost)
+      };
+    }
 
     const roomSnap = await get(ref(database, `music_rooms/${code}`));
     if (!roomSnap.exists()) {
       throw new Error(`Комната №${code} не найдена или уже закрыта`);
     }
 
-    const participantId = getOrCreateParticipantId();
     const roomVal = roomSnap.val();
     const isHost = roomVal.hostId === participantId;
-    const cleanName = (name || '').trim() || (isHost ? 'Диджей' : `Слушатель`);
+    const cleanName = (name || '').trim() || (isHost ? 'Диджей' : 'Слушатель');
     const cleanAvatar = avatar || getRandomAvatar();
     const now = getServerNow();
 
@@ -173,8 +260,22 @@ class MusicRoomClient {
   async reconnectRoom({ roomCode, connInstanceId }) {
     const code = String(roomCode || '').trim();
     if (!code) return null;
-
     const participantId = getOrCreateParticipantId();
+
+    if (IS_RU_SERVER_ENABLED) {
+      const res = await ruServerClient.reconnectRoom({
+        roomCode: code,
+        participantId,
+        connInstanceId
+      });
+      if (!res?.roomCode) return null;
+      return {
+        roomCode: res.roomCode,
+        participantId,
+        isHost: Boolean(res.isHost)
+      };
+    }
+
     const snap = await get(ref(database, `music_rooms/${code}`));
     if (!snap.exists()) return null;
 
@@ -207,14 +308,14 @@ class MusicRoomClient {
 
   subscribeRoom(roomCode, onUpdate, onDeleted) {
     const code = String(roomCode || '').trim();
+    const emit = createStabilizedEmitter(onUpdate);
+
+    if (IS_RU_SERVER_ENABLED) {
+      return ruServerClient.subscribeRoom(code, emit, onDeleted);
+    }
+
     const roomRef = ref(database, `music_rooms/${code}`);
     let hadData = false;
-    let prevQueueSig = '';
-    let prevQueueRef = null;
-    let prevPlaybackSig = '';
-    let prevPlaybackRef = null;
-    let prevSettingsSig = '';
-    let prevSettingsRef = null;
 
     const unsub = onValue(roomRef, (snap) => {
       const val = snap.val();
@@ -225,34 +326,7 @@ class MusicRoomClient {
         return;
       }
       hadData = true;
-      const next = normalizeRoomSnapshot(val);
-
-      // Стабилизируем ссылки неизменённых частей комнаты, чтобы React.memo панелей не перерисовывал треки при обновлении прогресса участников
-      const qSig = JSON.stringify(next.queue);
-      if (prevQueueRef && qSig === prevQueueSig) {
-        next.queue = prevQueueRef;
-      } else {
-        prevQueueSig = qSig;
-        prevQueueRef = next.queue;
-      }
-
-      const pSig = JSON.stringify(next.playback);
-      if (prevPlaybackRef && pSig === prevPlaybackSig) {
-        next.playback = prevPlaybackRef;
-      } else {
-        prevPlaybackSig = pSig;
-        prevPlaybackRef = next.playback;
-      }
-
-      const sSig = JSON.stringify(next.settings);
-      if (prevSettingsRef && sSig === prevSettingsSig) {
-        next.settings = prevSettingsRef;
-      } else {
-        prevSettingsSig = sSig;
-        prevSettingsRef = next.settings;
-      }
-
-      onUpdate(next);
+      emit(val);
     });
 
     return () => unsub();
@@ -262,6 +336,11 @@ class MusicRoomClient {
     const code = String(roomCode || '').trim();
     const participantId = getOrCreateParticipantId();
     if (!code) return;
+
+    if (IS_RU_SERVER_ENABLED) {
+      await ruServerClient.leaveRoom({ roomCode: code, participantId, isHost });
+      return;
+    }
 
     try {
       const pRef = ref(database, `music_rooms/${code}/participants/${participantId}`);
@@ -279,18 +358,40 @@ class MusicRoomClient {
   }
 
   async updateQueue(roomCode, queue) {
-    const cleanQueue = (queue || []).map((t, idx) => ({
-      id: String(t.id || ('t_' + idx + '_' + Date.now().toString(36))),
-      title: String(t.title || 'Трек'),
-      artist: String(t.artist || 'Исполнитель'),
-      album: t.album ? String(t.album) : null,
-      url: String(t.url || ''),
-      source: String(t.source || 'audio'),
-      thumbnail: t.thumbnail ? String(t.thumbnail) : null,
-      duration: Number(t.duration) || 0,
-      sizeBytes: Number(t.sizeBytes) || 0
-    }));
+    const cleanQueue = (queue || []).map((t, idx) => sanitizeQueueItem(t, idx));
+    if (IS_RU_SERVER_ENABLED) {
+      await ruServerClient.updateQueue(roomCode, cleanQueue);
+      return;
+    }
     await set(ref(database, `music_rooms/${roomCode}/queue`), cleanQueue);
+  }
+
+  /**
+   * Безопасное добавление треков в конец очереди (используется и хостом, и гостями при allowGuestQueue)
+   */
+  async appendTracksToQueue(roomCode, newTracks, currentQueueFallback = []) {
+    const cleanItems = (newTracks || []).map((t, idx) => sanitizeQueueItem(t, idx));
+    if (cleanItems.length === 0) return;
+
+    if (IS_RU_SERVER_ENABLED) {
+      await ruServerClient.appendTracksToQueue(roomCode, cleanItems);
+      return;
+    }
+
+    const qRef = ref(database, `music_rooms/${roomCode}/queue`);
+    const snap = await get(qRef);
+    const existingRaw = snap.exists() ? snap.val() : currentQueueFallback;
+    const existingList = Array.isArray(existingRaw)
+      ? existingRaw.filter(Boolean)
+      : existingRaw && typeof existingRaw === 'object'
+      ? Object.values(existingRaw).filter(Boolean)
+      : [];
+
+    const existingUrls = new Set(existingList.map((t) => t.url));
+    const filtered = cleanItems.filter((item) => item.url && !existingUrls.has(item.url));
+    if (filtered.length > 0) {
+      await set(qRef, [...existingList, ...filtered]);
+    }
   }
 
   async updatePlayback(roomCode, playbackPatch) {
@@ -301,20 +402,32 @@ class MusicRoomClient {
       }
     }
     if (Object.keys(clean).length > 0) {
+      if (IS_RU_SERVER_ENABLED) {
+        await ruServerClient.updatePlayback(roomCode, clean);
+        return;
+      }
       await update(ref(database, `music_rooms/${roomCode}/playback`), clean);
     }
   }
 
   async updateSettings(roomCode, settingsPatch) {
+    if (IS_RU_SERVER_ENABLED) {
+      await ruServerClient.updateSettings(roomCode, settingsPatch);
+      return;
+    }
     await update(ref(database, `music_rooms/${roomCode}/settings`), settingsPatch);
   }
 
   async updateParticipantStatus(roomCode, participantId, patch) {
+    if (IS_RU_SERVER_ENABLED) {
+      await ruServerClient.updateParticipantStatus(roomCode, patch);
+      return;
+    }
     await update(ref(database, `music_rooms/${roomCode}/participants/${participantId}`), patch);
   }
 
   async bumpConnInstanceId(roomCode, participantId, connInstanceId) {
-    await update(ref(database, `music_rooms/${roomCode}/participants/${participantId}`), {
+    await this.updateParticipantStatus(roomCode, participantId, {
       connInstanceId,
       isOnline: true,
       status: 'connecting'

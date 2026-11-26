@@ -23,7 +23,8 @@ import {
   Clock,
   Zap,
   ShieldCheck,
-  Bluetooth
+  Bluetooth,
+  Users
 } from 'lucide-react';
 
 function YouTubeIcon({ className = 'w-3 h-3 text-red-400' }) {
@@ -63,6 +64,7 @@ export default function PlayerCard({
   onNextTrack,
   onCycleRepeat,
   onToggleWaitForListeners,
+  onToggleAllowGuestQueue,
   onForceStartNow,
   onSeekChange,
   onSeekCommit,
@@ -652,6 +654,21 @@ export default function PlayerCard({
                   ? 'Синхро-барьер: ВКЛ'
                   : 'Синхро-барьер: ВЫКЛ'}
               </span>
+            </button>
+          )}
+
+          {isHost && onToggleAllowGuestQueue && (
+            <button
+              type="button"
+              onClick={onToggleAllowGuestQueue}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold border transition-all cursor-pointer ${
+                settings?.allowGuestQueue
+                  ? 'bg-indigo-500/20 text-indigo-300 border-indigo-400/40 hover:bg-indigo-500/30'
+                  : 'bg-slate-800/80 text-slate-400 border-white/10 hover:text-slate-200'
+              }`}
+            >
+              <Users className="w-3.5 h-3.5" />
+              <span>{settings?.allowGuestQueue ? 'Гости: +треки ВКЛ' : 'Гости: только хост'}</span>
             </button>
           )}
 

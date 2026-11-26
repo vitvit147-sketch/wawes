@@ -1,6 +1,7 @@
-// Инициализация Firebase Realtime Database и высокоточная NTP-синхронизация серверного времени
+// Инициализация Firebase Realtime Database или собственного RU WebSocket-сервера (если задан VITE_RU_SERVER_URL)
 import { initializeApp } from 'firebase/app';
 import { getDatabase, ref, onValue } from 'firebase/database';
+import { IS_RU_SERVER_ENABLED, ruServerClient } from './ruServerClient';
 
 const env = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : {};
 
@@ -14,8 +15,8 @@ export const firebaseConfig = {
   appId: env.VITE_FIREBASE_APP_ID || '1:287989185216:web:7c684d36d22f4d0346cb25'
 };
 
-export const app = initializeApp(firebaseConfig);
-export const database = getDatabase(app);
+export const app = IS_RU_SERVER_ENABLED ? null : initializeApp(firebaseConfig);
+export const database = IS_RU_SERVER_ENABLED ? null : getDatabase(app);
 
 let serverTimeOffsetMs = 0;
 let clockRttMs = null;
@@ -40,27 +41,29 @@ function notifyStatus() {
   });
 }
 
-try {
-  onValue(ref(database, '.info/connected'), (snap) => {
-    firebaseConnected = Boolean(snap.val());
-    notifyStatus();
-    if (firebaseConnected && !clockCalibrated) {
-      calibrateServerClock().catch(() => {});
-    }
-  });
-
-  onValue(ref(database, '.info/serverTimeOffset'), (snap) => {
-    const val = snap.val();
-    if (typeof val === 'number' && Number.isFinite(val)) {
-      // Используем базовый оффсет от WebSocket только пока не прошла точная NTP-калибровка по мин. RTT
-      if (!clockCalibrated) {
-        serverTimeOffsetMs = val;
-        notifyStatus();
+if (!IS_RU_SERVER_ENABLED) {
+  try {
+    onValue(ref(database, '.info/connected'), (snap) => {
+      firebaseConnected = Boolean(snap.val());
+      notifyStatus();
+      if (firebaseConnected && !clockCalibrated) {
+        calibrateServerClock().catch(() => {});
       }
-    }
-  });
-} catch (e) {
-  console.warn('Firebase time sync init error:', e);
+    });
+
+    onValue(ref(database, '.info/serverTimeOffset'), (snap) => {
+      const val = snap.val();
+      if (typeof val === 'number' && Number.isFinite(val)) {
+        // Используем базовый оффсет от WebSocket только пока не прошла точная NTP-калибровка по мин. RTT
+        if (!clockCalibrated) {
+          serverTimeOffsetMs = val;
+          notifyStatus();
+        }
+      }
+    });
+  } catch (e) {
+    console.warn('Firebase time sync init error:', e);
+  }
 }
 
 /**
@@ -68,6 +71,9 @@ try {
  * Убирает рассинхрон часов до ±15–25 мс между разными устройствами (ноутбук/планшет/телефон).
  */
 export async function calibrateServerClock(clientKey = '', options = {}) {
+  if (IS_RU_SERVER_ENABLED) {
+    return ruServerClient.calibrateClock(options);
+  }
   const { force = false } = options || {};
   if (typeof fetch !== 'function' || typeof performance === 'undefined') return null;
   if (clockCalibrated && !force && clockRttMs !== null && clockRttMs <= 260) {
@@ -154,14 +160,15 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
 }
 
 export function getServerNow() {
-  return Date.now() + serverTimeOffsetMs;
+  return IS_RU_SERVER_ENABLED ? ruServerClient.getServerNow() : Date.now() + serverTimeOffsetMs;
 }
 
 export function getServerTimeOffset() {
-  return serverTimeOffsetMs;
+  return IS_RU_SERVER_ENABLED ? ruServerClient.serverTimeOffsetMs : serverTimeOffsetMs;
 }
 
 export function getClockStats() {
+  if (IS_RU_SERVER_ENABLED) return ruServerClient.getClockStats();
   return {
     connected: firebaseConnected,
     serverTimeOffsetMs,
@@ -171,10 +178,11 @@ export function getClockStats() {
 }
 
 export function isFirebaseConnected() {
-  return firebaseConnected;
+  return IS_RU_SERVER_ENABLED ? ruServerClient.connected : firebaseConnected;
 }
 
 export function subscribeFirebaseStatus(cb) {
+  if (IS_RU_SERVER_ENABLED) return ruServerClient.subscribeStatus(cb);
   statusListeners.add(cb);
   cb(getClockStats());
   return () => statusListeners.delete(cb);
