@@ -8,7 +8,8 @@ import {
   Wifi,
   WifiOff,
   AlertTriangle,
-  Music2
+  Music2,
+  Download
 } from 'lucide-react';
 import { getSavedProfile, saveProfile } from '../utils/musicRoomClient';
 
@@ -26,6 +27,7 @@ export default function HomeScreen({
   const [avatar, setAvatar] = useState(saved.avatar || '🎧');
   const [roomCode, setRoomCode] = useState('');
   const [busyMode, setBusyMode] = useState(null); // 'create' | 'join' | null
+  const [installPrompt, setInstallPrompt] = useState(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -34,6 +36,29 @@ export default function HomeScreen({
       setRoomCode(paramCode.replace(/\D/g, '').slice(0, 6));
     }
   }, []);
+
+  useEffect(() => {
+    const onBeforeInstall = (e) => {
+      e.preventDefault();
+      setInstallPrompt(e);
+    };
+    const onInstalled = () => setInstallPrompt(null);
+    window.addEventListener('beforeinstallprompt', onBeforeInstall);
+    window.addEventListener('appinstalled', onInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', onBeforeInstall);
+      window.removeEventListener('appinstalled', onInstalled);
+    };
+  }, []);
+
+  const handleInstallPwa = async () => {
+    if (!installPrompt) return;
+    try {
+      await installPrompt.prompt();
+      const res = await installPrompt.userChoice;
+      if (res?.outcome === 'accepted') setInstallPrompt(null);
+    } catch {}
+  };
 
   const handleCreate = async () => {
     setErrorMessage('');
@@ -203,9 +228,21 @@ export default function HomeScreen({
           )}
         </div>
 
-        <div className="flex items-center gap-1.5 text-slate-400">
-          <Music2 className="w-3.5 h-3.5 text-sky-400" />
-          <span>YouTube · SoundCloud · Audio</span>
+        <div className="flex items-center gap-2 text-slate-400">
+          {installPrompt && (
+            <button
+              type="button"
+              onClick={handleInstallPwa}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-sky-500/15 hover:bg-sky-500/25 border border-sky-400/35 text-sky-300 font-bold transition-all cursor-pointer"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>Установить</span>
+            </button>
+          )}
+          <div className="flex items-center gap-1.5">
+            <Music2 className="w-3.5 h-3.5 text-sky-400" />
+            <span>YouTube · SoundCloud · Audio</span>
+          </div>
         </div>
       </footer>
     </div>

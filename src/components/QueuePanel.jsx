@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import {
   Music2,
   Plus,
@@ -17,7 +17,8 @@ import {
   X,
   Play,
   ListMusic,
-  Library
+  Library,
+  Upload
 } from 'lucide-react';
 import { formatDuration, formatBytes } from '../utils/audioMetadata';
 import { DEMO_PRESETS } from '../utils/mediaUrlResolver';
@@ -62,6 +63,8 @@ const QueuePanel = React.memo(function QueuePanel({
   playback,
   cacheVersion,
   isAddingUrl,
+  uploadState,
+  onUploadLocalFiles,
   onAddTrackByUrl,
   onAddBatchTracks,
   onPlayPresetNow,
@@ -79,6 +82,22 @@ const QueuePanel = React.memo(function QueuePanel({
   const [selectedAlbum, setSelectedAlbum] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showAllCatalog, setShowAllCatalog] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const handleFilePick = async (e) => {
+    const picked = e.target.files;
+    if (!picked || picked.length === 0) return;
+    setErrorMsg('');
+    try {
+      await onUploadLocalFiles?.(picked);
+      setViewMode('queue');
+    } catch (err) {
+      setErrorMsg(err?.message || 'Не удалось загрузить файл');
+      setViewMode('queue');
+    } finally {
+      e.target.value = '';
+    }
+  };
 
   const activeView = isHost ? viewMode : 'queue';
   const queueUrlSet = useMemo(() => new Set(queue.map((t) => t.url)), [queue]);
@@ -200,6 +219,32 @@ const QueuePanel = React.memo(function QueuePanel({
         )}
 
         <div className="flex items-center gap-2 text-xs">
+          {isHost && onUploadLocalFiles && (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept="audio/*,.mp3,.m4a,.aac,.ogg,.wav,.flac,.opus"
+                onChange={handleFilePick}
+                className="hidden"
+              />
+              <button
+                type="button"
+                disabled={isAddingUrl}
+                onClick={() => fileInputRef.current?.click()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-400/35 text-emerald-300 font-bold text-xs transition-all cursor-pointer disabled:opacity-50"
+              >
+                {uploadState ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Upload className="w-3.5 h-3.5" />
+                )}
+                <span>{uploadState ? `${uploadState.percent}%` : 'С телефона'}</span>
+              </button>
+            </>
+          )}
+
           {queue.length > 0 && (
             <span
               className={`px-2.5 py-1 rounded-xl font-bold border ${
@@ -213,6 +258,23 @@ const QueuePanel = React.memo(function QueuePanel({
           )}
         </div>
       </div>
+
+      {uploadState && (
+        <div className="mb-3.5 p-3 rounded-2xl bg-emerald-500/10 border border-emerald-400/30">
+          <div className="flex items-center justify-between gap-2 text-xs font-bold text-emerald-200 mb-1.5">
+            <span className="truncate">
+              Загрузка ({uploadState.index}/{uploadState.total}): {uploadState.fileName}
+            </span>
+            <span className="font-mono shrink-0">{uploadState.percent}%</span>
+          </div>
+          <div className="w-full h-1.5 rounded-full bg-slate-800 overflow-hidden">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-sky-400 transition-all duration-150"
+              style={{ width: `${Math.max(4, uploadState.percent)}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       {queue.length > 0 && cachedCount < queue.length && (
         <div className="mb-3.5 w-full h-1 rounded-full bg-slate-800 overflow-hidden">
@@ -635,7 +697,7 @@ const QueuePanel = React.memo(function QueuePanel({
                     setInputUrl(e.target.value);
                     if (errorMsg) setErrorMsg('');
                   }}
-                  placeholder="Ссылка SoundCloud, Яндекс Диск или MP3/M4A..."
+                  placeholder="Яндекс Диск (файл или папка), SoundCloud, MP3..."
                   disabled={isAddingUrl}
                   className="flex-1 rounded-2xl bg-slate-950/80 border border-white/10 px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 transition-colors"
                 />
@@ -644,7 +706,7 @@ const QueuePanel = React.memo(function QueuePanel({
                   disabled={isAddingUrl || !inputUrl.trim()}
                   className="px-4 py-2.5 rounded-2xl bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 disabled:opacity-40 text-white font-bold text-sm flex items-center gap-1.5 shadow-md transition-all cursor-pointer disabled:cursor-default shrink-0"
                 >
-                  {isAddingUrl ? (
+                  {isAddingUrl && !uploadState ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
                   ) : (
                     <Plus className="w-4 h-4" />

@@ -1,0 +1,13 @@
+{
+  "name": "wavesync-ru-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Лёгкий RU WebSocket + файловый сервер для WaveSync (замена Firebase RTDB)",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

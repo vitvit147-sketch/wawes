@@ -1,6 +1,7 @@
 // Загрузчик аудиотреков в RAM (Blob) и дисковый кэш браузера (Cache Storage)
 // с реальной шкалой прогресса и умным фоновым конвейером предзагрузки очереди
 import { inferMimeType } from './audioMetadata';
+import { parseRtdbTrackUrl, receiveTrackViaRtdb } from './rtdbAudioTransfer';
 
 const CACHE_NAME = 'wavesync-audio-v2';
 const MAX_MEMORY_BLOBS = 4;
@@ -46,7 +47,16 @@ if (typeof window !== 'undefined' && window.caches) {
     .then((cache) => cache.keys())
     .then((requests) => {
       for (const req of requests) {
-        if (req.url) persistedUrls.add(req.url);
+        if (!req.url) continue;
+        const marker = '/__rtdb_cache__/';
+        const idx = req.url.indexOf(marker);
+        if (idx >= 0) {
+          try {
+            persistedUrls.add(decodeURIComponent(req.url.slice(idx + marker.length)));
+          } catch {}
+        } else {
+          persistedUrls.add(req.url);
+        }
       }
       if (requests.length > 0) notifyCacheWatchers(true);
     })
@@ -61,7 +71,7 @@ export function subscribeTrackCache(cb) {
 export function resolvePlayableUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return '';
   const trimmed = rawUrl.trim();
-  if (/^(https?:|blob:|data:)/i.test(trimmed)) return trimmed;
+  if (/^(https?:|blob:|data:|rtdb-track:)/i.test(trimmed)) return trimmed;
   if (typeof window !== 'undefined' && window.location) {
     try {
       return new URL(trimmed, window.location.href).href;
@@ -70,6 +80,14 @@ export function resolvePlayableUrl(rawUrl) {
     }
   }
   return trimmed;
+}
+
+// Cache Storage привязан к origin HTTP/HTTPS, поэтому виртуальный URL rtdb-track:// кладём по каноническому HTTPS-ключу
+function toCacheStorageKey(resolvedUrl) {
+  if (resolvedUrl.startsWith('rtdb-track://') && typeof window !== 'undefined' && window.location) {
+    return `${window.location.origin}/__rtdb_cache__/${encodeURIComponent(resolvedUrl)}`;
+  }
+  return resolvedUrl;
 }
 
 export function isTrackCachedInMemory(rawUrl) {
@@ -160,7 +178,7 @@ async function tryReadFromCacheStorage(resolvedUrl) {
   if (typeof window === 'undefined' || !window.caches) return null;
   try {
     const cache = await window.caches.open(CACHE_NAME);
-    const match = await cache.match(resolvedUrl);
+    const match = await cache.match(toCacheStorageKey(resolvedUrl));
     if (!match) return null;
     const blob = await match.blob();
     if (!blob || blob.size === 0) return null;
@@ -185,12 +203,25 @@ async function tryWriteToCacheStorage(resolvedUrl, blob, contentType) {
         'Content-Length': String(blob.size)
       }
     });
-    await cache.put(resolvedUrl, response);
+    await cache.put(toCacheStorageKey(resolvedUrl), response);
     persistedUrls.add(resolvedUrl);
     notifyCacheWatchers(true);
   } catch {
     // Игнорируем нехватку квоты (например, приватный режим браузера)
   }
+}
+
+/**
+ * Сразу сохраняет локально выбранный на устройстве хоста аудиофайл в RAM + Cache Storage,
+ * чтобы хост мог играть его с задержкой 0 мс без повторного скачивания.
+ */
+export async function registerLocalAudioFile(rawUrl, file, mimeType) {
+  const resolvedUrl = resolvePlayableUrl(rawUrl);
+  if (!resolvedUrl || !file) return null;
+  const contentType = resolveMime(file.name || resolvedUrl, mimeType || file.type || '');
+  const blobUrl = storeMemoryBlob(resolvedUrl, file, contentType);
+  await tryWriteToCacheStorage(resolvedUrl, file, contentType);
+  return { playableUrl: blobUrl, sizeBytes: file.size || 0, contentType };
 }
 
 function storeMemoryBlob(resolvedUrl, blob, contentType) {
@@ -342,7 +373,46 @@ export async function loadTrackToBlobUrl(rawUrl, options = {}) {
       };
     }
 
-    // 5. Потоковое скачивание по сети
+    // 5. Если виртуальный трек с телефона хоста — скачиваем чанками через Firebase RTDB
+    const rtdbTarget = parseRtdbTrackUrl(resolvedUrl);
+    if (rtdbTarget) {
+      const startedAt = performance.now();
+      emitProgress(entry.latestProgress);
+      const { blob, mimeType } = await receiveTrackViaRtdb({
+        roomCode: rtdbTarget.roomCode,
+        trackId: rtdbTarget.trackId,
+        onProgress: (p) => {
+          emitProgress({
+            stage: 'downloading',
+            percent: p.percent,
+            loadedBytes: p.loadedBytes,
+            totalBytes: p.totalBytes || expectedSizeBytes || 0,
+            speedBps: 0,
+            fromCache: false
+          });
+        }
+      });
+      const contentType = resolveMime(resolvedUrl, mimeType || blob.type);
+      await tryWriteToCacheStorage(resolvedUrl, blob, contentType);
+      const blobUrl = entry.needBlobUrl ? storeMemoryBlob(resolvedUrl, blob, contentType) : null;
+      const totalElapsedSec = Math.max(0.05, (performance.now() - startedAt) / 1000);
+      emitProgress({
+        stage: 'ready',
+        percent: 100,
+        loadedBytes: blob.size,
+        totalBytes: blob.size,
+        speedBps: blob.size / totalElapsedSec,
+        fromCache: false
+      });
+      return {
+        playableUrl: blobUrl,
+        mode: entry.needBlobUrl ? 'memory' : 'disk-cache',
+        sizeBytes: blob.size,
+        fromCache: false
+      };
+    }
+
+    // 6. Потоковое скачивание по сети
     try {
       emitProgress(entry.latestProgress);
       const response = await fetch(resolvedUrl, { mode: 'cors', credentials: 'omit' });

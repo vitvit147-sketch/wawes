@@ -11,15 +11,22 @@ import {
   moveTrackAfterCurrent,
   buildPrefetchOrder
 } from '../utils/syncEngine';
-import { resolveTrackMetadata } from '../utils/mediaUrlResolver';
+import { resolveTrackMetadata, resolveTracksFromInput } from '../utils/mediaUrlResolver';
 import {
   loadTrackToBlobUrl,
   getMemoryCachedBlobUrl,
+  registerLocalAudioFile,
   setPinnedUrls,
   startQueuePrefetchPipeline,
   subscribeTrackCache,
   isTrackReadyInCache
 } from '../utils/trackLoader';
+import { extractAudioFileMetadata } from '../utils/audioMetadata';
+import {
+  buildRtdbTrackUrl,
+  sendTrackViaRtdb,
+  cleanupRtdbTransfer
+} from '../utils/rtdbAudioTransfer';
 import PlayerCard from './PlayerCard';
 import QueuePanel from './QueuePanel';
 import LobbyPanel from './LobbyPanel';
@@ -49,6 +56,7 @@ export default function RoomScreen({
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [isAddingUrl, setIsAddingUrl] = useState(false);
+  const [uploadState, setUploadState] = useState(null);
   const [showShareModal, setShowShareModal] = useState(false);
   const [cacheVersion, setCacheVersion] = useState(0);
   const [downloadState, setDownloadState] = useState({
@@ -764,6 +772,7 @@ export default function RoomScreen({
   // Очистить всю очередь
   const handleClearQueue = useCallback(async () => {
     if (!isHost || !room?.code) return;
+    const prevQueue = roomRef.current?.queue || [];
     await musicRoomClient.updateQueue(room.code, []);
     await musicRoomClient.updatePlayback(room.code, {
       trackId: null,
@@ -773,9 +782,94 @@ export default function RoomScreen({
       anchorServerTime: getServerNow(),
       actionNonce: Date.now()
     });
+    for (const t of prevQueue) {
+      if (String(t?.url || '').startsWith('rtdb-track://')) {
+        cleanupRtdbTransfer(room.code, t.id);
+      }
+    }
   }, [isHost, room?.code]);
 
-  // Добавление трека по ссылке или пресета
+  // Загрузка локальных аудиофайлов с телефона / ПК и передача в комнату
+  const handleUploadLocalFiles = useCallback(
+    async (fileList) => {
+      const files = Array.from(fileList || []).filter((f) => f && f.size > 0);
+      if (!isHost || !room?.code || files.length === 0) return;
+
+      const MAX_BYTES = 25 * 1024 * 1024;
+      const validFiles = files.filter((f) => f.size <= MAX_BYTES);
+      if (validFiles.length === 0) {
+        throw new Error('Файл больше 25 МБ. Выберите MP3/M4A до 25 МБ на трек.');
+      }
+
+      setIsAddingUrl(true);
+      const uploadedTracks = [];
+      try {
+        for (let i = 0; i < validFiles.length; i++) {
+          const file = validFiles[i];
+          setUploadState({
+            fileName: file.name,
+            percent: 2,
+            index: i + 1,
+            total: validFiles.length
+          });
+
+          const meta = await extractAudioFileMetadata(file);
+          if (meta.objectUrl) {
+            try {
+              URL.revokeObjectURL(meta.objectUrl);
+            } catch {}
+          }
+
+          const trackId = 'loc_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+          const rtdbUrl = buildRtdbTrackUrl(room.code, trackId);
+
+          await registerLocalAudioFile(rtdbUrl, file, meta.mimeType);
+          await sendTrackViaRtdb({
+            roomCode: room.code,
+            trackId,
+            file,
+            mimeType: meta.mimeType,
+            onProgress: (pct) => {
+              setUploadState({
+                fileName: file.name,
+                percent: pct,
+                index: i + 1,
+                total: validFiles.length
+              });
+            }
+          });
+
+          uploadedTracks.push({
+            id: trackId,
+            url: rtdbUrl,
+            title: meta.title || file.name.replace(/\.[^.]+$/, ''),
+            artist: meta.artist || 'С телефона',
+            album: 'С устройства',
+            thumbnail: null,
+            source: 'audio',
+            duration: meta.duration || 0,
+            sizeBytes: file.size || 0
+          });
+        }
+
+        if (uploadedTracks.length > 0) {
+          const currentQueue = roomRef.current?.queue || [];
+          const newQueue = [...currentQueue, ...uploadedTracks];
+          await musicRoomClient.updateQueue(room.code, newQueue);
+
+          if (!roomRef.current?.playback?.trackId || currentQueue.length === 0) {
+            await launchTrackAsHost(uploadedTracks[0].id, 0);
+          }
+        }
+      } finally {
+        setUploadState(null);
+        setIsAddingUrl(false);
+      }
+    },
+    [isHost, room?.code, launchTrackAsHost]
+  );
+
+  // Добавление трека или целой папки (Яндекс Диск / прямая ссылка / пресет)
   const handleAddTrackByUrl = useCallback(
     async (url, presetMeta = null) => {
       if (!isHost || !room?.code) return;
@@ -800,15 +894,36 @@ export default function RoomScreen({
           }
         }
 
-        let meta = presetMeta ? { ...presetMeta } : await resolveTrackMetadata(url);
-        if (!meta.id || currentQueue.some((t) => t.id === meta.id)) {
-          meta.id = 't_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-        }
-        const newQueue = [...currentQueue, meta];
-        await musicRoomClient.updateQueue(room.code, newQueue);
+        const resolvedList = presetMeta
+          ? [{ ...presetMeta }]
+          : await resolveTracksFromInput(url);
 
-        if (!roomRef.current?.playback?.trackId || currentQueue.length === 0) {
-          await launchTrackAsHost(meta.id, 0);
+        if (!resolvedList || resolvedList.length === 0) {
+          throw new Error('Не удалось распознать аудио по этой ссылке');
+        }
+
+        const existingByUrl = new Set(currentQueue.map((t) => t.url));
+        const usedIds = new Set(currentQueue.map((t) => t.id));
+        const itemsToAdd = [];
+
+        for (let i = 0; i < resolvedList.length; i++) {
+          const item = { ...resolvedList[i] };
+          if (existingByUrl.has(item.url)) continue;
+          if (!item.id || usedIds.has(item.id)) {
+            item.id = 't_' + Date.now().toString(36) + '_' + i + Math.random().toString(36).slice(2, 5);
+          }
+          usedIds.add(item.id);
+          existingByUrl.add(item.url);
+          itemsToAdd.push(item);
+        }
+
+        if (itemsToAdd.length > 0) {
+          const newQueue = [...currentQueue, ...itemsToAdd];
+          await musicRoomClient.updateQueue(room.code, newQueue);
+
+          if (!roomRef.current?.playback?.trackId || currentQueue.length === 0) {
+            await launchTrackAsHost(itemsToAdd[0].id, 0);
+          }
         }
       } finally {
         setIsAddingUrl(false);
@@ -1012,8 +1127,13 @@ export default function RoomScreen({
     async (trackId) => {
       if (!isHost || !room?.code) return;
       const q = roomRef.current?.queue || [];
+      const removedTrack = q.find((t) => t.id === trackId);
       const newQueue = q.filter((t) => t.id !== trackId);
       await musicRoomClient.updateQueue(room.code, newQueue);
+
+      if (removedTrack && String(removedTrack.url || '').startsWith('rtdb-track://')) {
+        cleanupRtdbTransfer(room.code, removedTrack.id);
+      }
 
       if (roomRef.current?.playback?.trackId === trackId) {
         if (newQueue.length > 0) {
@@ -1226,6 +1346,8 @@ export default function RoomScreen({
             playback={playback}
             cacheVersion={cacheVersion}
             isAddingUrl={isAddingUrl}
+            uploadState={uploadState}
+            onUploadLocalFiles={handleUploadLocalFiles}
             onAddTrackByUrl={handleAddTrackByUrl}
             onAddBatchTracks={handleAddBatchTracks}
             onPlayPresetNow={handlePlayPresetNow}
