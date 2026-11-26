@@ -209,6 +209,12 @@ class MusicRoomClient {
     const code = String(roomCode || '').trim();
     const roomRef = ref(database, `music_rooms/${code}`);
     let hadData = false;
+    let prevQueueSig = '';
+    let prevQueueRef = null;
+    let prevPlaybackSig = '';
+    let prevPlaybackRef = null;
+    let prevSettingsSig = '';
+    let prevSettingsRef = null;
 
     const unsub = onValue(roomRef, (snap) => {
       const val = snap.val();
@@ -219,7 +225,34 @@ class MusicRoomClient {
         return;
       }
       hadData = true;
-      onUpdate(normalizeRoomSnapshot(val));
+      const next = normalizeRoomSnapshot(val);
+
+      // Стабилизируем ссылки неизменённых частей комнаты, чтобы React.memo панелей не перерисовывал треки при обновлении прогресса участников
+      const qSig = JSON.stringify(next.queue);
+      if (prevQueueRef && qSig === prevQueueSig) {
+        next.queue = prevQueueRef;
+      } else {
+        prevQueueSig = qSig;
+        prevQueueRef = next.queue;
+      }
+
+      const pSig = JSON.stringify(next.playback);
+      if (prevPlaybackRef && pSig === prevPlaybackSig) {
+        next.playback = prevPlaybackRef;
+      } else {
+        prevPlaybackSig = pSig;
+        prevPlaybackRef = next.playback;
+      }
+
+      const sSig = JSON.stringify(next.settings);
+      if (prevSettingsRef && sSig === prevSettingsSig) {
+        next.settings = prevSettingsRef;
+      } else {
+        prevSettingsSig = sSig;
+        prevSettingsRef = next.settings;
+      }
+
+      onUpdate(next);
     });
 
     return () => unsub();
@@ -250,6 +283,7 @@ class MusicRoomClient {
       id: String(t.id || ('t_' + idx + '_' + Date.now().toString(36))),
       title: String(t.title || 'Трек'),
       artist: String(t.artist || 'Исполнитель'),
+      album: t.album ? String(t.album) : null,
       url: String(t.url || ''),
       source: String(t.source || 'audio'),
       thumbnail: t.thumbnail ? String(t.thumbnail) : null,

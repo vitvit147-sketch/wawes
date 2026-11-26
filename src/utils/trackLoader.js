@@ -36,7 +36,7 @@ function notifyCacheWatchers(immediate = false) {
         cb();
       } catch {}
     }
-  }, 180);
+  }, 420);
 }
 
 // Первичное сканирование уже скачанных на устройство треков при запуске
@@ -75,6 +75,19 @@ export function resolvePlayableUrl(rawUrl) {
 export function isTrackCachedInMemory(rawUrl) {
   const url = resolvePlayableUrl(rawUrl);
   return Boolean(url && memoryCache.has(url));
+}
+
+export function getMemoryCachedBlobUrl(rawUrl) {
+  const url = resolvePlayableUrl(rawUrl);
+  if (!url) return null;
+  const entry = memoryCache.get(url);
+  if (!entry) return null;
+  entry.lastUsedAt = Date.now();
+  return {
+    playableUrl: entry.blobUrl,
+    sizeBytes: entry.sizeBytes,
+    contentType: entry.contentType
+  };
 }
 
 export function isTrackReadyInCache(rawUrl) {

@@ -14,6 +14,7 @@ import {
 import { resolveTrackMetadata } from '../utils/mediaUrlResolver';
 import {
   loadTrackToBlobUrl,
+  getMemoryCachedBlobUrl,
   setPinnedUrls,
   startQueuePrefetchPipeline,
   subscribeTrackCache,
@@ -29,6 +30,7 @@ export default function RoomScreen({
   participantId,
   isHost,
   firebaseStatus,
+  sharedAudioRef,
   onLeaveRoom
 }) {
   const playerRef = useRef(null);
@@ -200,6 +202,30 @@ export default function RoomScreen({
       return;
     }
 
+    // Мгновенный синхронный путь: если трек уже в RAM — не сбрасываем playableUrl и не шлём лишний downloading:0%
+    const memHit = getMemoryCachedBlobUrl(currentTrack.url);
+    if (memHit) {
+      setDownloadState({
+        trackId: currentTrack.id,
+        stage: 'ready',
+        percent: 100,
+        loadedBytes: memHit.sizeBytes || currentTrack.sizeBytes || 0,
+        totalBytes: memHit.sizeBytes || currentTrack.sizeBytes || 0,
+        speedBps: 0,
+        fromCache: true,
+        playableUrl: memHit.playableUrl,
+        mode: 'memory'
+      });
+      musicRoomClient
+        .updateParticipantStatus(code, participantId, {
+          status: 'ready',
+          readyTrackId: currentTrack.id,
+          downloadProgress: 100
+        })
+        .catch(() => {});
+      return;
+    }
+
     setDownloadState({
       trackId: currentTrack.id,
       stage: 'downloading',
@@ -212,13 +238,16 @@ export default function RoomScreen({
       mode: 'memory'
     });
 
-    musicRoomClient
-      .updateParticipantStatus(code, participantId, {
-        status: 'downloading',
-        readyTrackId: null,
-        downloadProgress: 0
-      })
-      .catch(() => {});
+    // Не спамим статусом 'downloading: 0%', если трек уже в Cache Storage (чтение с диска займёт ~15 мс)
+    if (!isTrackReadyInCache(currentTrack.url)) {
+      musicRoomClient
+        .updateParticipantStatus(code, participantId, {
+          status: 'downloading',
+          readyTrackId: null,
+          downloadProgress: 0
+        })
+        .catch(() => {});
+    }
 
     loadTrackToBlobUrl(currentTrack.url, {
       expectedSizeBytes: currentTrack.sizeBytes || 0,
@@ -382,7 +411,12 @@ export default function RoomScreen({
     if (launchedBarrierNonceRef.current === playback.actionNonce) return;
 
     launchedBarrierNonceRef.current = playback.actionNonce;
-    const leadMs = barrierState.onlineCount > 1 ? 650 : 120;
+    const rttEstimate = Number(firebaseStatus?.clockRttMs);
+    const adaptiveOnlineLead =
+      Number.isFinite(rttEstimate) && rttEstimate > 0
+        ? Math.max(420, Math.min(780, rttEstimate * 2 + 220))
+        : 580;
+    const leadMs = barrierState.onlineCount > 1 ? adaptiveOnlineLead : 90;
 
     musicRoomClient
       .updatePlayback(room.code, {
@@ -402,7 +436,8 @@ export default function RoomScreen({
     playback.actionNonce,
     playback.anchorPos,
     barrierState.allReady,
-    barrierState.onlineCount
+    barrierState.onlineCount,
+    firebaseStatus?.clockRttMs
   ]);
 
   // Актуальный срез состояния для стабильного интервала синхронизации (не перезапускается от RTDB-обновлений участников)
@@ -895,6 +930,7 @@ export default function RoomScreen({
 
   const handleSeekCommit = useCallback(
     async (e) => {
+      if (!isSeekingRef.current) return;
       isSeekingRef.current = false;
       if (!isHost || !room?.code) return;
 
@@ -1084,13 +1120,26 @@ export default function RoomScreen({
 
   const handlePlayerError = useCallback(
     (err) => {
+      if (err?.name === 'AbortError') return;
       console.warn('Playback error / policy block:', err);
-      if (playback.isPlaying && playback.phase !== 'buffering') {
+      const isPolicyError =
+        err?.name === 'NotAllowedError' ||
+        /notallowed|gesture|interact|autoplay/i.test(String(err?.message || ''));
+      if (isPolicyError && playback.isPlaying && playback.phase !== 'buffering') {
         setAutoplayBlocked(true);
       }
     },
     [playback.isPlaying, playback.phase]
   );
+
+  const handleToggleMute = useCallback(() => {
+    setIsMuted((v) => !v);
+  }, []);
+
+  const handleVolumeChange = useCallback((newVol) => {
+    setVolume(newVol);
+    setIsMuted((prev) => (prev ? false : prev));
+  }, []);
 
   return (
     <div className="min-h-[100dvh] flex flex-col pb-10">
@@ -1128,6 +1177,7 @@ export default function RoomScreen({
       <main className="max-w-5xl w-full mx-auto p-4 sm:p-6 space-y-6 flex-1">
         <PlayerCard
           playerRef={playerRef}
+          sharedAudioRef={sharedAudioRef}
           room={room}
           isHost={isHost}
           firebaseStatus={firebaseStatus}
@@ -1157,11 +1207,8 @@ export default function RoomScreen({
           onForceStartNow={handleForceStartNow}
           onSeekChange={handleSeekChange}
           onSeekCommit={handleSeekCommit}
-          onToggleMute={() => setIsMuted((v) => !v)}
-          onVolumeChange={(newVol) => {
-            setVolume(newVol);
-            if (isMuted) setIsMuted(false);
-          }}
+          onToggleMute={handleToggleMute}
+          onVolumeChange={handleVolumeChange}
           onPlayerDuration={handlePlayerDuration}
           onPlayerEnded={handlePlayerEnded}
           onPlayerReady={handlePlayerReady}

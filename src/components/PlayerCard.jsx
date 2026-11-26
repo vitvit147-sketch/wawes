@@ -1,9 +1,10 @@
-import React, { useRef, useEffect, useState } from 'react';
-import ReactPlayer from 'react-player';
+import React, { useRef, useEffect, useState, Suspense } from 'react';
 import { getServerNow } from '../utils/firebase';
 import { computeExpectedPosition, getStartCountdownMs } from '../utils/syncEngine';
 import { formatDuration, formatBytes } from '../utils/audioMetadata';
 import AudioWaveVisualizer from './AudioWaveVisualizer';
+
+const ReactPlayer = React.lazy(() => import('react-player'));
 import {
   Play,
   Pause,
@@ -35,6 +36,7 @@ function YouTubeIcon({ className = 'w-3 h-3 text-red-400' }) {
 
 export default function PlayerCard({
   playerRef,
+  sharedAudioRef,
   room,
   isHost,
   firebaseStatus,
@@ -86,7 +88,8 @@ export default function PlayerCard({
 
   const playableAudioSrc = isAudioForCurrentTrack ? downloadState.playableUrl : '';
 
-  const audioElRef = useRef(null);
+  const localAudioRef = useRef(null);
+  const audioElRef = sharedAudioRef || localAudioRef;
   const soundcloudPlayerRef = useRef(null);
   const loadedTrackIdRef = useRef(null);
   const launchTimerRef = useRef(null);
@@ -96,6 +99,18 @@ export default function PlayerCard({
   const isPlayPendingRef = useRef(false);
   const readyNotifiedKeyRef = useRef('');
   const lastStartedKeyRef = useRef('');
+  const audioEventsRef = useRef({});
+
+  audioEventsRef.current = {
+    trackId: currentTrack?.id || null,
+    playableAudioSrc,
+    onPlayerDuration,
+    onPlayerReady,
+    onPlayerBuffer,
+    onPlayerBufferEnd,
+    onPlayerEnded,
+    onPlayerError
+  };
 
   const [audioPausedState, setAudioPausedState] = useState(true);
 
@@ -277,28 +292,129 @@ export default function PlayerCard({
     } catch {}
   }, [currentTrack?.id, effectiveDuration, displayTime]);
 
+  // Подписка событий на едином <audio> элементе (общий unlocked элемент из App или локальный fallback)
+  useEffect(() => {
+    const audio = audioElRef.current;
+    if (!audio) return;
+
+    const onLoadedMetadata = () => {
+      const ev = audioEventsRef.current;
+      if (!ev.playableAudioSrc) return;
+      loadedTrackIdRef.current = ev.trackId;
+      ev.onPlayerDuration?.(audio.duration);
+      if (pendingSeekRef.current !== null) {
+        try {
+          audio.currentTime = pendingSeekRef.current;
+        } catch {}
+        pendingSeekRef.current = null;
+      }
+    };
+
+    const onCanPlay = () => {
+      const ev = audioEventsRef.current;
+      if (!ev.playableAudioSrc) return;
+      loadedTrackIdRef.current = ev.trackId;
+      if (pendingSeekRef.current !== null) {
+        try {
+          audio.currentTime = pendingSeekRef.current;
+        } catch {}
+        pendingSeekRef.current = null;
+      }
+      const readyKey = `${ev.playableAudioSrc}::${ev.trackId || ''}`;
+      if (readyNotifiedKeyRef.current !== readyKey) {
+        readyNotifiedKeyRef.current = readyKey;
+        ev.onPlayerReady?.();
+      }
+    };
+
+    const onWaiting = () => {
+      if (!audioEventsRef.current.playableAudioSrc) return;
+      audioEventsRef.current.onPlayerBuffer?.();
+    };
+
+    const onPlaying = () => {
+      if (!audioEventsRef.current.playableAudioSrc) return;
+      setAudioPausedState(false);
+      audioEventsRef.current.onPlayerBufferEnd?.();
+    };
+
+    const onPause = () => {
+      setAudioPausedState(true);
+    };
+
+    const onDurationChange = () => {
+      const ev = audioEventsRef.current;
+      if (!ev.playableAudioSrc) return;
+      ev.onPlayerDuration?.(audio.duration);
+    };
+
+    const onEnded = () => {
+      const ev = audioEventsRef.current;
+      if (!ev.playableAudioSrc) return;
+      ev.onPlayerEnded?.();
+    };
+
+    const onError = (e) => {
+      const ev = audioEventsRef.current;
+      if (!ev.playableAudioSrc) return;
+      console.warn('Native audio error:', e);
+      ev.onPlayerError?.(e);
+    };
+
+    audio.addEventListener('loadedmetadata', onLoadedMetadata);
+    audio.addEventListener('canplay', onCanPlay);
+    audio.addEventListener('waiting', onWaiting);
+    audio.addEventListener('playing', onPlaying);
+    audio.addEventListener('pause', onPause);
+    audio.addEventListener('durationchange', onDurationChange);
+    audio.addEventListener('ended', onEnded);
+    audio.addEventListener('error', onError);
+
+    return () => {
+      audio.removeEventListener('loadedmetadata', onLoadedMetadata);
+      audio.removeEventListener('canplay', onCanPlay);
+      audio.removeEventListener('waiting', onWaiting);
+      audio.removeEventListener('playing', onPlaying);
+      audio.removeEventListener('pause', onPause);
+      audio.removeEventListener('durationchange', onDurationChange);
+      audio.removeEventListener('ended', onEnded);
+      audio.removeEventListener('error', onError);
+    };
+  }, [audioElRef]);
+
   // Отдельный эффект только для громкости — не сбрасывает воспроизведение и seek!
   useEffect(() => {
     if (audioElRef.current) {
       audioElRef.current.volume = isMuted ? 0 : volume;
     }
-  }, [volume, isMuted]);
+  }, [volume, isMuted, audioElRef]);
 
-  // Смена src у постоянного <audio> DOM-элемента (не размонтируем элемент для сохранения autoplay на планшетах)
+  // Смена src у постоянного <audio> DOM-элемента без сброса разблокировки автоплея между треками
   useEffect(() => {
     const audio = audioElRef.current;
     if (!audio) return;
 
-    if (isSoundCloud || !playableAudioSrc) {
+    if (isSoundCloud || !currentTrack?.id) {
       loadedTrackIdRef.current = null;
       readyNotifiedKeyRef.current = '';
       lastStartedKeyRef.current = '';
       pendingSeekRef.current = null;
-      if (audio.getAttribute('src')) {
+      const curAttr = audio.getAttribute('src') || '';
+      if (curAttr && !curAttr.startsWith('data:audio/wav')) {
         audio.pause();
         audio.removeAttribute('src');
         audio.load();
       }
+      return;
+    }
+
+    if (!playableAudioSrc) {
+      // Во время промежуточной загрузки трека не сбрасываем src/load(), чтобы сохранить autoplay на iOS/Android
+      loadedTrackIdRef.current = null;
+      readyNotifiedKeyRef.current = '';
+      lastStartedKeyRef.current = '';
+      pendingSeekRef.current = null;
+      audio.pause();
       return;
     }
 
@@ -311,7 +427,7 @@ export default function PlayerCard({
       audio.src = playableAudioSrc;
       audio.load();
     }
-  }, [playableAudioSrc, isSoundCloud]);
+  }, [playableAudioSrc, isSoundCloud, currentTrack?.id, audioElRef]);
 
   // Управление барьерным запуском (будущий anchorServerTime), паузой и входом в середину трека
   useEffect(() => {
@@ -455,84 +571,51 @@ export default function PlayerCard({
 
   return (
     <section className="rounded-3xl bg-gradient-to-br from-slate-900/95 via-slate-900/90 to-indigo-950/60 border border-white/12 p-5 sm:p-6 shadow-2xl relative overflow-hidden">
-      {/* Постоянно смонтированный <audio> элемент — sr-only вместо display:none для стабильной работы в фоне */}
-      <audio
-        ref={audioElRef}
-        preload="auto"
-        playsInline
-        className="sr-only"
-        onLoadedMetadata={(e) => {
-          loadedTrackIdRef.current = currentTrack?.id || null;
-          onPlayerDuration?.(e.target.duration);
-          if (pendingSeekRef.current !== null) {
-            try {
-              e.target.currentTime = pendingSeekRef.current;
-            } catch {}
-            pendingSeekRef.current = null;
-          }
-        }}
-        onCanPlay={(e) => {
-          loadedTrackIdRef.current = currentTrack?.id || null;
-          if (pendingSeekRef.current !== null) {
-            try {
-              e.target.currentTime = pendingSeekRef.current;
-            } catch {}
-            pendingSeekRef.current = null;
-          }
-          const readyKey = `${playableAudioSrc}::${currentTrack?.id || ''}`;
-          if (readyNotifiedKeyRef.current !== readyKey) {
-            readyNotifiedKeyRef.current = readyKey;
-            onPlayerReady?.();
-          }
-        }}
-        onWaiting={() => onPlayerBuffer?.()}
-        onPlaying={() => {
-          setAudioPausedState(false);
-          onPlayerBufferEnd?.();
-        }}
-        onPause={() => setAudioPausedState(true)}
-        onDurationChange={(e) => onPlayerDuration?.(e.target.duration)}
-        onEnded={() => onPlayerEnded?.()}
-        onError={(e) => {
-          if (playableAudioSrc) {
-            console.warn('Native audio error:', e);
-            onPlayerError?.(e);
-          }
-        }}
-      />
+      {/* Локальный fallback <audio>, если компонент смонтирован вне App */}
+      {!sharedAudioRef && (
+        <audio ref={localAudioRef} preload="auto" playsInline className="sr-only" />
+      )}
 
-      {/* Виджет для SoundCloud */}
+      {/* Виджет для SoundCloud (подгружается только при выборе SoundCloud-трека) */}
       {isSoundCloud && currentTrack?.url && (
         <div className="mb-5 w-full rounded-2xl overflow-hidden shadow-lg border border-white/10 bg-black/70">
-          <ReactPlayer
-            ref={soundcloudPlayerRef}
-            url={currentTrack.url}
-            playing={Boolean(playback?.isPlaying && playback?.phase !== 'buffering')}
-            volume={isMuted ? 0 : volume}
-            muted={isMuted}
-            playbackRate={playback?.playbackRate || 1.0}
-            width="100%"
-            height="160px"
-            playsinline
-            progressInterval={400}
-            onProgress={onPlayerProgress}
-            onDuration={onPlayerDuration}
-            onEnded={onPlayerEnded}
-            onReady={onPlayerReady}
-            onBuffer={onPlayerBuffer}
-            onBufferEnd={onPlayerBufferEnd}
-            onError={onPlayerError}
-            config={{
-              soundcloud: {
-                options: {
-                  auto_play: false,
-                  show_artwork: true,
-                  visual: true,
-                  color: '#0284c7'
+          <Suspense
+            fallback={
+              <div className="h-[160px] flex items-center justify-center text-xs text-slate-400">
+                Загрузка плеера SoundCloud...
+              </div>
+            }
+          >
+            <ReactPlayer
+              ref={soundcloudPlayerRef}
+              url={currentTrack.url}
+              playing={Boolean(playback?.isPlaying && playback?.phase !== 'buffering')}
+              volume={isMuted ? 0 : volume}
+              muted={isMuted}
+              playbackRate={playback?.playbackRate || 1.0}
+              width="100%"
+              height="160px"
+              playsinline
+              progressInterval={400}
+              onProgress={onPlayerProgress}
+              onDuration={onPlayerDuration}
+              onEnded={onPlayerEnded}
+              onReady={onPlayerReady}
+              onBuffer={onPlayerBuffer}
+              onBufferEnd={onPlayerBufferEnd}
+              onError={onPlayerError}
+              config={{
+                soundcloud: {
+                  options: {
+                    auto_play: false,
+                    show_artwork: true,
+                    visual: true,
+                    color: '#0284c7'
+                  }
                 }
-              }
-            }}
-          />
+              }}
+            />
+          </Suspense>
         </div>
       )}
 
@@ -657,8 +740,8 @@ export default function PlayerCard({
                 loading="lazy"
               />
               {playback?.isPlaying && playback?.phase !== 'buffering' && !audioPausedState && (
-                <div className="absolute inset-0 bg-sky-500/20 backdrop-blur-[1px] flex items-center justify-center">
-                  <span className="w-3 h-3 rounded-full bg-sky-400 animate-ping" />
+                <div className="absolute inset-0 bg-sky-500/15 flex items-center justify-center">
+                  <span className="w-3 h-3 rounded-full bg-sky-400 shadow-[0_0_12px_rgba(56,189,248,0.9)]" />
                 </div>
               )}
             </div>
@@ -845,8 +928,11 @@ export default function PlayerCard({
           value={Math.min(displayTime, Math.max(1, effectiveDuration))}
           disabled={!isHost || !currentTrack}
           onChange={onSeekChange}
-          onMouseUp={onSeekCommit}
-          onTouchEnd={onSeekCommit}
+          onPointerUp={onSeekCommit}
+          onPointerCancel={onSeekCommit}
+          onKeyUp={(e) => {
+            if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') onSeekCommit(e);
+          }}
           className="w-full wave-range disabled:cursor-default"
         />
         <div className="flex items-center justify-between text-xs font-mono text-slate-400 mt-1.5">

@@ -1,10 +1,11 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { subscribeFirebaseStatus } from './utils/firebase';
 import {
   musicRoomClient,
   getOrCreateParticipantId,
   generateConnInstanceId
 } from './utils/musicRoomClient';
+import { unlockAudioElement } from './utils/audioUnlock';
 import HomeScreen from './components/HomeScreen';
 import RoomScreen from './components/RoomScreen';
 
@@ -23,15 +24,20 @@ export default function App() {
   );
 
   const participantId = getOrCreateParticipantId();
+  const sharedAudioRef = useRef(null);
 
   useEffect(() => {
     return subscribeFirebaseStatus(setFirebaseStatus);
   }, []);
 
-  // Авто-переподключение в комнату при обновлении вкладки
+  // Авто-переподключение в комнату при обновлении вкладки (если в URL не передана другая комната)
   useEffect(() => {
     const savedCode = sessionStorage.getItem(STORAGE_ROOM_KEY);
-    if (!savedCode) {
+    const urlRoomCode = new URLSearchParams(window.location.search).get('room')?.replace(/\D/g, '');
+    if (!savedCode || (urlRoomCode && urlRoomCode !== savedCode)) {
+      if (urlRoomCode && savedCode && urlRoomCode !== savedCode) {
+        sessionStorage.removeItem(STORAGE_ROOM_KEY);
+      }
       setIsReconnecting(false);
       return;
     }
@@ -83,6 +89,7 @@ export default function App() {
   }, [activeRoomCode]);
 
   const handleCreateRoom = useCallback(async ({ name, avatar }) => {
+    unlockAudioElement(sharedAudioRef.current);
     const connInstanceId = generateConnInstanceId();
     const { roomCode, initialRoom } = await musicRoomClient.createRoom({
       name,
@@ -95,6 +102,7 @@ export default function App() {
   }, []);
 
   const handleJoinRoom = useCallback(async ({ roomCode, name, avatar }) => {
+    unlockAudioElement(sharedAudioRef.current);
     const connInstanceId = generateConnInstanceId();
     const res = await musicRoomClient.joinRoom({
       roomCode,
@@ -124,34 +132,42 @@ export default function App() {
     [activeRoomCode]
   );
 
+  let screen = null;
   if (isReconnecting) {
-    return (
+    screen = (
       <div className="min-h-[100dvh] flex items-center justify-center text-slate-400 text-sm font-semibold">
         Подключаемся к комнате...
       </div>
     );
-  }
-
-  if (activeRoomCode && roomData) {
+  } else if (activeRoomCode && roomData) {
     const isHost = roomData.hostId === participantId;
-    return (
+    screen = (
       <RoomScreen
         room={roomData}
         participantId={participantId}
         isHost={isHost}
         firebaseStatus={firebaseStatus}
+        sharedAudioRef={sharedAudioRef}
         onLeaveRoom={handleLeaveRoom}
+      />
+    );
+  } else {
+    screen = (
+      <HomeScreen
+        firebaseStatus={firebaseStatus}
+        errorMessage={errorMessage}
+        setErrorMessage={setErrorMessage}
+        onCreateRoom={handleCreateRoom}
+        onJoinRoom={handleJoinRoom}
       />
     );
   }
 
   return (
-    <HomeScreen
-      firebaseStatus={firebaseStatus}
-      errorMessage={errorMessage}
-      setErrorMessage={setErrorMessage}
-      onCreateRoom={handleCreateRoom}
-      onJoinRoom={handleJoinRoom}
-    />
+    <>
+      {screen}
+      {/* Единый постоянно смонтированный <audio> для сохранения разрешения автоплея на iOS Safari / Android при входе */}
+      <audio ref={sharedAudioRef} preload="auto" playsInline className="sr-only" />
+    </>
   );
 }

@@ -83,7 +83,7 @@ export async function calibrateServerClock(clientKey = '', options = {}) {
     const pingUrl = `${firebaseConfig.databaseURL}/music_rooms/_ping/${encodeURIComponent(id)}.json`;
 
     const samples = [];
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 5; i++) {
       try {
         const wallBefore = Date.now();
         const perfBefore = performance.now();
@@ -103,6 +103,13 @@ export async function calibrateServerClock(clientKey = '', options = {}) {
         const wallMid = wallBefore + rtt / 2;
         const offset = serverTs - wallMid;
         samples.push({ index: i, rtt, offset });
+
+        // Сразу публикуем предварительный оффсет после первого прогретого замера, чтобы мгновенный старт не ждал всю серию
+        if (i === 1 && !clockCalibrated) {
+          serverTimeOffsetMs = Math.round(offset);
+          clockRttMs = Math.round(rtt);
+          notifyStatus();
+        }
       } catch {
         // Игнорируем единичный сбой пинга
       }
