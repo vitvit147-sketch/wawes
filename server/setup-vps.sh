@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Автоматический установщик WaveSync (фронтенд + RU WebSocket/HTTP сервер + Nginx + HTTPS + PM2)
+# Автоматический установщик WaveSync + «Игры для компании» (/games/)
+# Запуск со своим доменом (поддерживается Punycode):
+#   curl -4 -sL https://raw.githubusercontent.com/vitvit147-sketch/wawes/main/server/setup-vps.sh | sudo bash -s -- xn--90aipmfnffdc2f5a.space
 
 CUSTOM_DOMAIN="${1:-}"
 REPO_URL="https://github.com/vitvit147-sketch/wawes.git"
@@ -75,10 +77,10 @@ if ! command -v pm2 >/dev/null 2>&1; then
   npm install -g pm2
 fi
 
-echo "=== [3/7] Скачивание проекта WaveSync (IPv4) ==="
+echo "=== [3/7] Скачивание/обновление проекта WaveSync + «Игры для компании» (IPv4) ==="
 if [ -d "$APP_DIR/.git" ]; then
   if ! git -C "$APP_DIR" -c http.version=HTTP/1.1 fetch -4 --depth 1 origin main; then
-    echo "git fetch не ответил, обновляем через tar.gz..."
+    echo "git fetch не ответил, скачиваем заново..."
     rm -rf "$APP_DIR"
   else
     git -C "$APP_DIR" reset --hard origin/main
@@ -94,6 +96,14 @@ if [ ! -d "$APP_DIR/src" ]; then
     tar -xzf /tmp/wawes.tar.gz -C "$APP_DIR" --strip-components=1
     rm -f /tmp/wawes.tar.gz
   fi
+fi
+
+# Распаковка сборки «Игры для компании» для маршрута /games/
+if [ -f "$APP_DIR/server/games-dist.tar.gz" ]; then
+  rm -rf "$APP_DIR/games-dist"
+  mkdir -p "$APP_DIR/games-dist"
+  tar -xzf "$APP_DIR/server/games-dist.tar.gz" -C "$APP_DIR/games-dist"
+  echo "«Игры для компании» распакованы в $APP_DIR/games-dist"
 fi
 
 echo "=== [4/7] Установка зависимостей RU-сервера и фронтенда ==="
@@ -113,7 +123,7 @@ echo "=== [6/7] Подбор домена и выпуск бесплатного
 PUBLIC_IP="$(curl -4 -fsS --connect-timeout 6 --max-time 10 https://api.ipify.org \
   || curl -4 -fsS --connect-timeout 6 --max-time 10 https://ifconfig.me \
   || curl -4 -fsS --connect-timeout 6 --max-time 10 https://ident.me \
-  || true)"
+  || echo 168.113.142.76)"
 PUBLIC_IP="$(echo "$PUBLIC_IP" | tr -d '[:space:]')"
 IP_DASH="${PUBLIC_IP//./-}"
 
@@ -141,6 +151,16 @@ server {
     root $APP_DIR/dist;
     index index.html;
     client_max_body_size 55M;
+
+    location = /games {
+        return 301 /games/;
+    }
+
+    location /games/ {
+        alias $APP_DIR/games-dist/;
+        index index.html;
+        try_files \$uri \$uri/ /games/index.html;
+    }
 
     location /ws {
         proxy_pass http://127.0.0.1:3080;
@@ -201,6 +221,7 @@ systemctl reload nginx
 
 echo ""
 echo "================================================================"
-echo "  ГОТОВО! WaveSync запущен на российском сервере!"
-echo "  Откройте в браузере: $SITE_URL"
+echo "  ГОТОВО! Оба проекта запущены на российском сервере!"
+echo "  Музыка (WaveSync):        $SITE_URL"
+echo "  Игры для компании:        $SITE_URL/games/"
 echo "================================================================"
