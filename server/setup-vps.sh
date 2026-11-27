@@ -2,19 +2,26 @@
 set -euo pipefail
 
 # Автоматический установщик WaveSync (фронтенд + RU WebSocket/HTTP сервер + Nginx + HTTPS + PM2)
-# Запуск без домена (авто-домен sslip.io / nip.io / traefik.me):
-#   curl -4 -sL https://raw.githubusercontent.com/vitvit147-sketch/wawes/main/server/setup-vps.sh | sudo bash
-# Запуск со своим .ru доменом:
-#   curl -4 -sL https://raw.githubusercontent.com/vitvit147-sketch/wawes/main/server/setup-vps.sh | sudo bash -s -- ваш-домен.ru
 
 CUSTOM_DOMAIN="${1:-}"
 REPO_URL="https://github.com/vitvit147-sketch/wawes.git"
+TAR_URL="https://codeload.github.com/vitvit147-sketch/wawes/tar.gz/refs/heads/main"
 APP_DIR="/opt/wavesync"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Запустите скрипт с правами root (через sudo bash ...)"
   exit 1
 fi
+
+echo "=== [0/7] Оптимизация MTU и IPv4 для облачной сети VK Cloud ==="
+DEFAULT_IFACE="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}' || true)"
+if [ -n "$DEFAULT_IFACE" ]; then
+  ip link set dev "$DEFAULT_IFACE" mtu 1400 || true
+  echo "MTU 1400 установлен на интерфейсе $DEFAULT_IFACE"
+fi
+
+export PATH="/usr/local/bin:/snap/bin:$PATH"
+export NODE_OPTIONS="--dns-result-order=ipv4first --max-old-space-size=1024"
 
 echo "=== [1/7] Настройка swap (1.5 ГБ для стабильной сборки на 1 ГБ RAM) ==="
 if [ ! -f /swapfile ] && [ "$(swapon --show | wc -l)" -le 1 ]; then
@@ -25,10 +32,12 @@ if [ ! -f /swapfile ] && [ "$(swapon --show | wc -l)" -le 1 ]; then
   echo '/swapfile none swap sw 0 0' >> /etc/fstab || true
 fi
 
-echo "=== [2/7] Установка системных пакетов (git, curl, nginx, certbot, Node.js 20) ==="
+echo "=== [2/7] Проверка и установка системных пакетов ==="
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y curl git ca-certificates gnupg xz-utils nginx certbot python3-certbot-nginx
+if ! command -v nginx >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+  apt-get update -y
+  apt-get install -y curl git ca-certificates gnupg xz-utils nginx certbot python3-certbot-nginx
+fi
 
 install_node20() {
   if command -v node >/dev/null 2>&1; then
@@ -54,26 +63,37 @@ install_node20() {
   echo "Fallback: установка Node.js 20 через snap..."
   if command -v snap >/dev/null 2>&1 && snap install node --classic --channel=20/stable; then
     export PATH="/snap/bin:$PATH"
-    echo "Node.js $(node -v) установлен через snap!"
     return 0
   fi
 
-  echo "Fallback: установка через NodeSource (IPv4)..."
   curl -4 -fsSL --connect-timeout 15 --max-time 60 https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
 }
 
 install_node20
-export PATH="/usr/local/bin:/snap/bin:$PATH"
-npm install -g pm2
+if ! command -v pm2 >/dev/null 2>&1; then
+  npm install -g pm2
+fi
 
-echo "=== [3/7] Скачивание репозитория WaveSync ==="
+echo "=== [3/7] Скачивание проекта WaveSync (IPv4) ==="
 if [ -d "$APP_DIR/.git" ]; then
-  git -C "$APP_DIR" fetch --depth 1 origin main
-  git -C "$APP_DIR" reset --hard origin/main
-else
+  if ! git -C "$APP_DIR" -c http.version=HTTP/1.1 fetch -4 --depth 1 origin main; then
+    echo "git fetch не ответил, обновляем через tar.gz..."
+    rm -rf "$APP_DIR"
+  else
+    git -C "$APP_DIR" reset --hard origin/main
+  fi
+fi
+
+if [ ! -d "$APP_DIR/src" ]; then
   rm -rf "$APP_DIR"
-  git clone --depth 1 "$REPO_URL" "$APP_DIR"
+  if ! git -c http.version=HTTP/1.1 clone -4 --depth 1 "$REPO_URL" "$APP_DIR"; then
+    echo "git clone не прошёл, скачиваем архивом через curl -4..."
+    curl -4 -fSL --connect-timeout 15 --max-time 180 "$TAR_URL" -o /tmp/wawes.tar.gz
+    mkdir -p "$APP_DIR"
+    tar -xzf /tmp/wawes.tar.gz -C "$APP_DIR" --strip-components=1
+    rm -f /tmp/wawes.tar.gz
+  fi
 fi
 
 echo "=== [4/7] Установка зависимостей RU-сервера и фронтенда ==="
@@ -170,10 +190,10 @@ echo "=== [7/7] Сборка фронтенда с подключённым RU-�
 cd "$APP_DIR"
 if [ -n "$ACTIVE_DOMAIN" ]; then
   SITE_URL="https://$ACTIVE_DOMAIN"
-  VITE_RU_SERVER_URL="$SITE_URL" NODE_OPTIONS="--max-old-space-size=1024" npm run build
+  VITE_RU_SERVER_URL="$SITE_URL" npm run build
 else
   SITE_URL="http://${PUBLIC_IP:-168.113.142.76}"
-  VITE_RU_SERVER_URL="$SITE_URL" NODE_OPTIONS="--max-old-space-size=1024" npm run build
+  VITE_RU_SERVER_URL="$SITE_URL" npm run build
   echo "Внимание: SSL не удалось выпустить автоматически, сайт работает по HTTP ($SITE_URL)."
 fi
 
